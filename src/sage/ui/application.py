@@ -16,6 +16,7 @@ from ..models import ScanResult, VolumeInfo
 from ..platform.windows.drives import list_ntfs_volumes
 from ..platform.windows.file_operations import shell_file_operation
 from ..services.evidence import EvidenceAssistant
+from ..services.local_ai import ConversationAssistant, OllamaClient
 from ..services.scanner import analyze_sizes, scan_ntfs
 from .assistant_panel import AssistantPanel
 from .styles import configure_styles
@@ -53,6 +54,9 @@ class SageApplication(tk.Tk):
         self._size_cancel = threading.Event()
         self._result: ScanResult | None = None
         self._assistant = EvidenceAssistant()
+        self._conversation = ConversationAssistant()
+        self._assistant_busy = False
+        self._assistant_request_id = 0
         self._volumes: dict[str, VolumeInfo] = {}
         self._clipboard_paths: list[str] = []
         self._clipboard_action = "copy"
@@ -67,7 +71,21 @@ class SageApplication(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(50, self._drain_events)
         self.after(200, self._bring_to_front)
+        self.after(300, self._warm_ai)
         self._load_volumes()
+
+    def _warm_ai(self) -> None:
+        self.assistant_panel.set_status("Loading local AI in the background…")
+
+        def worker() -> None:
+            try:
+                OllamaClient().chat([])
+                status = "Local AI ready"
+            except RuntimeError:
+                status = "Local AI unavailable — basic scan answers still work"
+            self._events.put(("ai_ready", self._generation, status))
+
+        threading.Thread(target=worker, daemon=True, name="sage-ai-warmup").start()
 
     def _bring_to_front(self) -> None:
         """Make the post-UAC window visible instead of leaving it behind the caller."""
@@ -163,6 +181,10 @@ class SageApplication(tk.Tk):
         self._result = None
         self._pending_size_completion = None
         self._assistant = EvidenceAssistant()
+        self._conversation = ConversationAssistant()
+        if self._assistant_busy:
+            self.assistant_panel.finish_reply("The drive scan changed. Ask again once the new tree is ready.")
+        self._assistant_busy = False
         self.tree_panel.clear()
         self.progress_bar.stop()
         self.progress_bar.configure(mode="indeterminate")
@@ -214,6 +236,8 @@ class SageApplication(tk.Tk):
                 if len(event) > 1 and event[1] != self._generation:
                     continue
                 kind = event[0]
+                if kind.startswith("assistant_") and event[2] != self._assistant_request_id:
+                    continue
                 if kind == "mft_progress":
                     _, _, count, fraction = event
                     if fraction is None:
@@ -255,6 +279,16 @@ class SageApplication(tk.Tk):
                         self._pending_size_completion = event[2]
                     else:
                         self._size_finished(event[2])
+                elif kind == "assistant_answer":
+                    self._assistant_busy = False
+                    self.assistant_panel.finish_reply(event[3])
+                elif kind == "assistant_token":
+                    self.assistant_panel.append_reply(event[3])
+                elif kind == "assistant_status":
+                    self.assistant_panel.set_status(event[3])
+                elif kind == "ai_ready":
+                    if not self._assistant_busy:
+                        self.assistant_panel.set_status(event[2])
                 elif kind == "error":
                     self._job_failed(event[2], event[3])
                 elif kind == "operation_done":
@@ -281,6 +315,11 @@ class SageApplication(tk.Tk):
         self._size_started_at = time.monotonic()
         self._result = result
         self._assistant.set_result(result)
+        if self._assistant_busy:
+            self._assistant_request_id += 1
+            self.assistant_panel.finish_reply("The new drive tree is ready. Please ask your question again.")
+            self._assistant_busy = False
+        self._conversation = ConversationAssistant(result)
         self.tree_panel.show_result(result)
         self.assistant_panel.write("SAGE", self._assistant.scan_summary())
         self.progress_bar.stop()
@@ -322,8 +361,30 @@ class SageApplication(tk.Tk):
         self.assistant_panel.write("SAGE", f"{phase} failed:\n{exc}")
         messagebox.showerror(APP_NAME, f"{phase} failed.\n\n{exc}")
 
-    def _answer(self, question: str) -> str:
-        return self._assistant.answer(question)
+    def _answer(self, question: str) -> str | None:
+        conversation = self._conversation
+        if self._assistant_busy:
+            return "I am still answering the previous question. Please try again shortly."
+        self._assistant_busy = True
+        self._assistant_request_id += 1
+        request_id = self._assistant_request_id
+        generation = self._generation
+        selected_paths = tuple(self._selected_paths())
+        self.assistant_panel.begin_reply()
+
+        def worker() -> None:
+            try:
+                answer = conversation.answer(
+                    question, selected_paths,
+                    on_token=lambda token: self._events.put(("assistant_token", generation, request_id, token)),
+                    on_status=lambda status: self._events.put(("assistant_status", generation, request_id, status)),
+                )
+            except Exception as exc:
+                answer = f"Could not answer from the current scan: {exc}"
+            self._events.put(("assistant_answer", generation, request_id, answer))
+
+        threading.Thread(target=worker, daemon=True, name="sage-local-ai").start()
+        return None
 
     def _selected_paths(self) -> list[str]:
         result = self._result

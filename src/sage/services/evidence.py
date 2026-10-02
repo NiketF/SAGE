@@ -80,7 +80,8 @@ class EvidenceAssistant:
             return self.scan_summary()
         return (
             "I can currently answer evidence-backed questions about scan counts, used space, "
-            "and the largest top-level folders. No external AI service is connected."
+            "and the largest top-level folders. This basic answer uses scan metadata only; "
+            "it cannot determine which files you should delete."
         )
 
     def _largest_folders(self, result: ScanResult) -> str:
@@ -109,4 +110,3 @@ class EvidenceAssistant:
         if self.result is None:
             raise RuntimeError("Scan an NTFS drive before asking evidence questions.")
         return self.result
-
