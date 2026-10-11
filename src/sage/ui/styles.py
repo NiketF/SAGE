@@ -119,7 +119,7 @@ def configure_styles(style: ttk.Style) -> None:
     style.layout("Navigation.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
     style.configure("Navigation.Treeview", background=SURFACE, fieldbackground=SURFACE, foreground=TEXT,
                     rowheight=26, font=FONT, borderwidth=0)
-    style.map("Navigation.Treeview", background=[("selected", SURFACE)], foreground=[("selected", TEXT)])
+    style.map("Navigation.Treeview", background=[("selected", SELECTION)], foreground=[("selected", TEXT)])
 
     for orient in ("Vertical", "Horizontal"):
         style.configure(f"{orient}.TScrollbar", background="#D4D4D4", troughcolor=SURFACE,

@@ -42,13 +42,17 @@ class AssistantPanel(ttk.Frame):
         self._phase_index = 0
         self._dot_index = 0
         self._got_backend_status = False
+        self._enter_press_handled = False
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
 
         # ── Section header ────────────────────────────────────────────
-        ttk.Label(self, text="Assistant", style="Section.TLabel", padding=(16, 12, 16, 10)).grid(
-            row=0, column=0, columnspan=2, sticky="ew"
-        )
+        header = ttk.Frame(self, style="Surface.TFrame", padding=(16, 12, 16, 10))
+        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Label(header, text="SAGE", style="Section.TLabel").pack(side="left")
+        self.ai_status = tk.StringVar(value="Local AI: Checking…")
+        self._ai_status_label = ttk.Label(header, textvariable=self.ai_status, style="SurfaceMuted.TLabel")
+        self._ai_status_label.pack(side="right")
         ttk.Separator(self, orient="horizontal").grid(row=1, column=0, columnspan=2, sticky="ew")
 
         # ── Transcript ────────────────────────────────────────────────
@@ -147,7 +151,8 @@ class AssistantPanel(ttk.Frame):
             selectforeground=TEXT,
         )
         self.question.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        self.question.bind("<Control-Return>", self._submit)
+        self.question.bind("<Return>", self._send_on_enter)
+        self.question.bind("<KP_Enter>", self._send_on_enter)
         self.question.bind("<Button-3>", self._show_prompt_menu)
 
         btn_frame = ttk.Frame(composer, style="Surface.TFrame")
@@ -156,10 +161,17 @@ class AssistantPanel(ttk.Frame):
         self.ask_button = ttk.Button(btn_frame, text="Ask", style="Accent.TButton",
                                      command=self._submit, width=6)
         self.ask_button.grid(row=0, column=0, sticky="ew")
-
-        ttk.Label(composer, text="Ctrl+Enter to send", style="Hint.TLabel").grid(
-            row=1, column=0, sticky="w", pady=(3, 0)
-        )
+        self.ask_button.bind("<Return>", self._send_on_enter)
+        self.ask_button.bind("<KP_Enter>", self._send_on_enter)
+        self._enter_root = self.winfo_toplevel()
+        self._enter_bindings = {key: self._enter_root.bind(key, self._send_from_composer, add="+")
+                                for key in ("<Return>", "<KP_Enter>")}
+        for key in ("<KeyRelease-Return>", "<KeyRelease-KP_Enter>"):
+            self._enter_bindings[key] = self._enter_root.bind(key, self._send_on_release, add="+")
+        for widget in (self.question, self.ask_button):
+            for modifier in ("Control", "Alt", "Shift"):
+                for key in ("Return", "KP_Enter"):
+                    widget.bind(f"<{modifier}-{key}>", self._ignore_modified_enter)
 
         # Context menu for prompt (editable)
         self._prompt_menu = tk.Menu(self, tearoff=False)
@@ -240,10 +252,16 @@ class AssistantPanel(ttk.Frame):
         self._animate()
         self._schedule_next_phase()
 
+    def set_ai_status(self, text: str, online: bool) -> None:
+        self.ai_status.set(f"Local AI: {text}")
+        self._ai_status_label.configure(foreground=ACCENT if online else TEXT_SECONDARY)
+
     def set_status(self, phase: str) -> None:
         """Called by the backend with a real stage update."""
         self._got_backend_status = True
         self._phase = phase
+        if not self._busy:
+            self.activity_text.set(phase)
         # Don't override the cycling display text — _animate handles it
 
     def _set_thinking_phase(self, text: str) -> None:
@@ -327,6 +345,31 @@ class AssistantPanel(ttk.Frame):
         self.ask_button.configure(state="normal")
 
     # ── Submit ────────────────────────────────────────────────────────
+
+    def _send_on_enter(self, event: tk.Event) -> str:
+        # Plain Enter sends; modified Enter never becomes another send shortcut.
+        self._enter_press_handled = True
+        if event.state & 0x2000D:
+            return "break"
+        self._submit()
+        return "break"
+
+    def _ignore_modified_enter(self, event: tk.Event) -> str:
+        # Tk can match Alt bindings for a Mod2/Num Lock event. Check the
+        # actual modifier bits instead of rejecting that event by its binding.
+        return self._send_on_enter(event)
+
+    def _send_on_release(self, event: tk.Event) -> str | None:
+        handled = self._enter_press_handled
+        self._enter_press_handled = False
+        if not handled:
+            return self._send_from_composer(event)
+        return None
+
+    def _send_from_composer(self, event: tk.Event) -> str | None:
+        if self.focus_get() in (self.question, self.ask_button):
+            return self._send_on_enter(event)
+        return None
 
     def _submit(self, _event: object = None) -> str | None:
         question = self.question.get("1.0", "end-1c").strip()
@@ -412,6 +455,8 @@ class AssistantPanel(ttk.Frame):
         return "break"
 
     def destroy(self) -> None:
+        for key, binding in self._enter_bindings.items():
+            self._enter_root.unbind(key, binding)
         for job in (self._spinner_job, self._render_job, self._phase_job):
             if job:
                 self.after_cancel(job)

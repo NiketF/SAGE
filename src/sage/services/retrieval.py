@@ -6,6 +6,9 @@ import heapq
 import ntpath
 import os
 import re
+import json
+import time
+import mimetypes
 
 from ..models import FileRecord, ScanResult
 from .evidence import format_bytes
@@ -27,18 +30,24 @@ def assess_path(path: str, system_drive: str | None = None) -> dict[str, str]:
     if not drive or not parts:
         return {"risk": "protected", "guidance": "Do not delete or move a drive root."}
     first = parts[0]
+    if first in {"$mft", "$mftmirr", "$bitmap", "$logfile", "$boot", "$secure", "$volume", "$attrdef", "$upcase", "$extend", "$badclus"}:
+        return {"risk": "protected", "guidance": "This is NTFS filesystem metadata used to maintain the drive. $MFT records its files and folders; other NTFS metadata supports allocation, recovery, security or filesystem structure. Do not manually delete or relocate it; doing so can damage the filesystem and make files inaccessible."}
     # ponytail: path rules identify likely roles, not installed dependencies.
     # Add verified application/known-folder evidence here when available.
-    if ".git" in parts or first == "git" or "git" in parts:
+    if ".git" in parts:
         return {"risk": "protected", "guidance": "This is repository metadata. Deleting it can lose local history, branches and uncommitted repository state; moving it alone can break the repository. Keep it with its project."}
     if first == "users" and len(parts) <= 2:
         return {"risk": "protected", "guidance": "This is a user-profile container. Do not delete or move the whole container; inspect its individual documents, downloads and application data instead."}
     if first in {"program files", "program files (x86)", "programdata", "system volume information", "recovery"}:
         action = "Use Windows Installed apps to uninstall an application you no longer use." if first.startswith("program files") else "Use Windows Storage cleanup or the relevant application settings."
-        return {"risk": "protected", "guidance": f"Do not directly delete or move this system/application location. {action}"}
+        if len(parts) == 1 or first in {"system volume information", "recovery"}:
+            return {"risk": "protected", "guidance": f"Do not directly delete or move this container. {action}"}
+        return {"risk": "unverified", "guidance": "This is an application location. Its contents and application ownership need assessment; location alone does not establish that every item is required or removable."}
     if drive == system:
         if first in {"windows", "boot"}:
-            return {"risk": "protected", "guidance": "Do not directly delete or move this system location. Use Windows Storage cleanup instead."}
+            if len(parts) == 1 or first == "boot" or parts in (["windows", "system32"], ["windows", "syswow64"], ["windows", "winsxs"]):
+                return {"risk": "protected", "guidance": "This container supports Windows. Inspect individual contents rather than deleting or relocating the whole container."}
+            return {"risk": "unverified", "guidance": "This is inside Windows. Establish the specific item's role and dependencies before recommending deletion or relocation; location alone is not proof of necessity."}
         if first in {"pagefile.sys", "swapfile.sys", "hiberfil.sys"}:
             return {"risk": "protected", "guidance": "Windows manages this file; do not delete it directly."}
         if first == "users" and "appdata" in parts:
@@ -46,7 +55,7 @@ def assess_path(path: str, system_drive: str | None = None) -> dict[str, str]:
                 return {"risk": "managed_cleanup", "guidance": "This matches pip's conventional cache location, not installed packages. Verify the exact cache with `python -m pip cache dir`; if it matches, use `python -m pip cache purge`. Purging discards cached downloads/wheels and may require downloading or rebuilding them later. Do not move the folder manually."}
             if len(parts) >= 5 and parts[2:5] == ["appdata", "local", "temp"]:
                 return {"risk": "managed_cleanup", "guidance": "This matches the user temporary-data location. Some files may still be in use. Use Windows Temporary files cleanup for eligible contents; do not delete or relocate the entire Temp folder."}
-            return {"risk": "protected", "guidance": "Application data can contain settings and state. Do not delete the folder directly."}
+            return {"risk": "unverified", "guidance": "Application data can contain settings, caches and personal state. Assess this particular item's role instead of treating all application data alike."}
     if "downloads" in parts or "documents" in parts or "desktop" in parts:
         return {"risk": "review", "guidance": "Personal files require your review and a backup check before removal."}
     if ntpath.splitext(normalized)[1] == ".log":
@@ -63,9 +72,160 @@ class ScanEvidence:
         self._largest_cache: dict[tuple, tuple[int, ...]] = {}
         self._name_cache: dict[tuple, tuple[int, ...]] = {}
         self._summary: dict | None = None
+        self._role_cache: dict[str, tuple[float, dict]] = {}
+        self._applications: tuple[float, list[dict]] | None = None
+
+    def _installed_applications(self) -> list[dict]:
+        """Cache local install records; an absent record never proves an app unused."""
+        now = time.monotonic()
+        if self._applications and now - self._applications[0] < 60:
+            return self._applications[1]
+        apps = []
+        try:
+            import winreg
+            deadline = now + 0.04
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                    try:
+                        with winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", 0, winreg.KEY_READ | view) as root:
+                            for index in range(winreg.QueryInfoKey(root)[0]):
+                                if time.monotonic() >= deadline:
+                                    break
+                                try:
+                                    with winreg.OpenKey(root, winreg.EnumKey(root, index)) as key:
+                                        name = winreg.QueryValueEx(key, "DisplayName")[0]
+                                        location = winreg.QueryValueEx(key, "InstallLocation")[0]
+                                        if isinstance(name, str) and isinstance(location, str) and ntpath.isabs(location) and ntpath.dirname(ntpath.normpath(location)) != ntpath.normpath(location):
+                                            apps.append({"name": name[:100], "location": ntpath.normpath(location)})
+                                except OSError:
+                                    continue
+                    except OSError:
+                        continue
+        except ImportError:
+            pass
+        # ponytail: a 40 ms inventory budget can yield partial records. Missing
+        # matches stay unknown; use on-demand app-specific lookup if needed later.
+        self._applications = (now, apps)
+        return apps
+
+    def _read_excerpt(self, record: FileRecord, limit: int = 2048) -> dict:
+        """Read only a small selected local file; never execute it or follow links."""
+        path = self.result.path_for(record.frn)
+        if not path or not record.size_ready or record.size_error or record.logical_size > limit:
+            return {"status": "not_read", "reason": "Only small measured files are eligible."}
+        current = record.frn
+        seen = set()
+        while True:
+            if current in seen or current not in self.result.records:
+                return {"status": "not_read", "reason": "Unresolved ancestry."}
+            seen.add(current)
+            ancestor = self.result.records[current]
+            if ancestor.attributes & 0x400:
+                return {"status": "not_read", "reason": "Reparse point."}
+            if current == self.result.root_frn:
+                break
+            current = ancestor.parent_frn
+        try:
+            current_path = path
+            while ntpath.dirname(current_path) != current_path:
+                info = os.lstat(current_path)
+                if getattr(info, "st_file_attributes", 0) & 0x400:
+                    return {"status": "not_read", "reason": "Current path contains a reparse point."}
+                current_path = ntpath.dirname(current_path)
+            with open(path, "rb") as stream:
+                if os.name == "nt":
+                    import ctypes
+                    import msvcrt
+                    resolved = ctypes.create_unicode_buffer(32768)
+                    function = ctypes.windll.kernel32.GetFinalPathNameByHandleW
+                    function.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32]
+                    length = function(msvcrt.get_osfhandle(stream.fileno()), resolved, len(resolved), 0)
+                    final_path = resolved.value.removeprefix("\\\\?\\")
+                    if not length or length >= len(resolved) or ntpath.normcase(final_path) != ntpath.normcase(ntpath.normpath(path)):
+                        return {"status": "not_read", "reason": "Opened path did not match the scanned target."}
+                data = stream.read(limit + 1)
+            if len(data) > limit:
+                return {"status": "not_read", "reason": "File exceeds the excerpt limit."}
+            if b"\x00" in data:
+                return {"status": "binary", "bytes_read": len(data)}
+            text = data.decode("utf-8-sig")
+            if any(ord(char) < 32 and char not in "\n\r\t" for char in text):
+                return {"status": "binary", "bytes_read": len(data)}
+            return {"status": "text", "bytes_read": len(data), "text": text}
+        except (OSError, UnicodeError, KeyError):
+            return {"status": "unavailable", "reason": "Contents could not be inspected."}
+
+    def role_evidence(self, path: str) -> dict:
+        """Bounded evidence about this item, not a declaration that it is safe."""
+        key = ntpath.normcase(path)
+        now = time.monotonic()
+        if key in self._role_cache and now - self._role_cache[key][0] < 30:
+            return self._role_cache[key][1]
+        entry = self.inspect(path)
+        if "error" in entry:
+            return entry
+        record = self.result.records[entry["frn"]]
+        if record.attributes & 0x400:
+            return {"path": entry["path"], "role": "Unresolved", "contents_read": False,
+                    "coverage": "Reparse point contents were not inspected.",
+                    "dependencies_verified": False, "owner_verified": False}
+        children = self.result.children.get(record.frn, ())
+        names = {self.result.records[frn].name.casefold(): frn for frn in children[:128]}
+        observed = [self.result.records[frn].name for frn in children[:12]]
+        evidence = {"path": entry["path"], "observed_children": observed,
+                    "coverage": f"Sampled {min(len(children), 128)} of {len(children)} direct children.",
+                    "role": "Unresolved", "basis": "Scan metadata", "contents_read": False,
+                    "dependencies_verified": False, "owner_verified": False}
+        matches = [app for app in self._installed_applications() if self.within(path, app["location"])]
+        evidence["installation_matches"] = sorted(matches, key=lambda app: len(app["location"]), reverse=True)[:2]
+        evidence["inventory_coverage"] = "Partial local installation records; no match does not establish an orphan."
+        if record.is_directory:
+            if "steam.exe" in names and ("steamapps" in names or "userdata" in names):
+                evidence["role"] = "Steam client installation"
+                evidence["has_user_data"] = "userdata" in names
+                evidence["basis"] = "Observed steam.exe and Steam data directories"
+                evidence["action"] = "Do not delete the whole installation to clean individual data. Games or the installation can be relocated through Steam's supported procedure."
+                if "steamapps" in names:
+                    nested = self.result.children.get(names["steamapps"], ())
+                    evidence["steam_data"] = [self.result.records[frn].name for frn in nested[:16]]
+                    common = next((frn for frn in nested if self.result.records[frn].name.casefold() == "common"), None)
+                    if common is not None:
+                        games = self.result.children.get(common, ())
+                        evidence["game_folders"] = [self.result.records[frn].name for frn in games[:8]]
+                        evidence["game_folder_count"] = len(games)
+            elif matches:
+                evidence["role"] = f"Inside the registered installation of {evidence['installation_matches'][0]['name']}"
+            elif ".git" in names:
+                evidence["role"] = "Project containing Git repository metadata"
+            for filename in ("package.json", "pyproject.toml", "appmanifest.acf"):
+                if filename not in names:
+                    continue
+                excerpt = self._read_excerpt(self.result.records[names[filename]])
+                evidence["manifest"] = {"filename": filename, **excerpt}
+                evidence["contents_read"] = excerpt.get("status") in {"text", "binary"}
+                if filename == "package.json" and excerpt.get("status") == "text":
+                    try:
+                        data = json.loads(excerpt["text"])
+                        if isinstance(data, dict):
+                            evidence["package"] = {field: str(data[field])[:120] for field in ("name", "description") if field in data}
+                    except ValueError:
+                        pass
+                if "text" in evidence["manifest"]:
+                    evidence["manifest"]["text"] = evidence["manifest"]["text"][:512]
+                break
+        elif record.logical_size <= 2048 and not path.casefold().split("\\")[-1].startswith("$"):
+            evidence["excerpt"] = self._read_excerpt(record)
+            evidence["contents_read"] = evidence["excerpt"].get("status") in {"text", "binary"}
+            if "text" in evidence["excerpt"]:
+                evidence["excerpt"]["text"] = evidence["excerpt"]["text"][:512]
+        evidence["file_type"] = mimetypes.guess_type(path)[0] if not record.is_directory else None
+        if len(self._role_cache) >= 32:
+            self._role_cache.clear()
+        self._role_cache[key] = (now, evidence)
+        return evidence
 
     _IGNORED = frozenset({
-        "a", "an", "and", "are", "can", "could", "delete", "do", "does", "drive", "file", "files", "folder",
+        "a", "an", "and", "are", "be", "both", "can", "could", "deleted", "delete", "do", "does", "drive", "file", "files", "folder",
         "folders", "for", "from", "have", "how", "i", "in", "is", "it", "keep", "me", "move", "my", "of", "on",
         "or", "please", "remove", "should", "that", "the", "this", "to", "what", "which", "would", "you",
         "about", "big", "details", "give", "information", "large", "largest", "biggest", "list", "much",
@@ -351,7 +511,7 @@ class ScanEvidence:
                         continue
                     if "appdata" in parts and "programs" in parts:
                         continue
-                    if "appdata" in parts and risk == "protected":
+                    if "appdata" in parts and risk in {"protected", "unverified"}:
                         index = parts.index("appdata")
                         suffix = parts[index + 1:]
                         if suffix and suffix not in (["local"], ["local", "pip"]):
