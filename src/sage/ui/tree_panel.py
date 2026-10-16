@@ -12,10 +12,11 @@ from ..services.evidence import attributes_text, format_bytes
 class TreePanel(ttk.Frame):
     COLUMNS = ("allocated", "logical", "items", "files", "folders", "attrs")
 
-    def __init__(self, parent: tk.Misc) -> None:
+    def __init__(self, parent: tk.Misc, on_sort=None) -> None:
         super().__init__(parent, style="Surface.TFrame")
         self.result: ScanResult | None = None
         self._sort_mode = "name_asc"
+        self._on_sort = on_sort
         self.folder_icon, self.file_icon, self.drive_icon = self._make_icons()
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -24,8 +25,8 @@ class TreePanel(ttk.Frame):
         self.tree = ttk.Treeview(self, columns=self.COLUMNS, show="tree headings", selectmode="browse")
         self.tree.heading("#0", text="Name", anchor="w")
         headings = {
-            "allocated": "Allocated",
-            "logical": "Size",
+            "allocated": "Space Used",
+            "logical": "File Size",
             "items": "Items",
             "files": "Files",
             "folders": "Folders",
@@ -34,7 +35,9 @@ class TreePanel(ttk.Frame):
         for column, label in headings.items():
             self.tree.heading(column, text=label, anchor="e" if column != "attrs" else "center")
 
-        self.tree.column("#0", width=330, minwidth=180, stretch=True)
+        for column, field in (("#0", "name"), ("logical", "logical"), ("allocated", "allocated")):
+            self.tree.heading(column, command=lambda field=field: self._toggle_sort(field))
+        self.tree.column("#0", width=240, minwidth=180, stretch=True)
         self.tree.column("allocated", width=100, anchor="e")
         self.tree.column("logical", width=100, anchor="e")
         self.tree.column("items", width=80, anchor="e")
@@ -114,9 +117,24 @@ class TreePanel(ttk.Frame):
 
     # ── Sorting ───────────────────────────────────────────────────────
 
+    def _toggle_sort(self, field: str) -> None:
+        if self.result is None:
+            return
+        direction = "asc" if field == "name" else "desc"
+        if self._sort_mode.startswith(field+"_"):
+            direction = "desc" if self._sort_mode.endswith("_asc") else "asc"
+        self.apply_sort(field+"_"+direction)
+
     def apply_sort(self, mode: str) -> None:
         """Change sort mode and re-sort all currently loaded tree items."""
         self._sort_mode = mode
+        for column, field, label in (("#0", "name", "Name"), ("logical", "logical", "File Size"), ("allocated", "allocated", "Space Used")):
+            suffix = ""
+            if mode.startswith(field+"_"):
+                suffix = " \u2191" if mode.endswith("_asc") else " \u2193"
+            self.tree.heading(column, text=label+suffix)
+        if self._on_sort:
+            self._on_sort(mode)
         if self.result is None:
             return
         for root_iid in self.tree.get_children(""):

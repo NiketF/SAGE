@@ -21,8 +21,15 @@ from ..services.evidence import EvidenceAssistant, format_bytes
 from ..services.local_ai import ConversationAssistant, OllamaClient
 from ..services.scanner import analyze_sizes, scan_ntfs
 from .assistant_panel import AssistantPanel
-from .styles import configure_styles
+from .styles import ACCENT, SURFACE, TEXT, TEXT_SECONDARY, configure_styles
 from .tree_panel import TreePanel
+
+
+SORT_MODES = {
+    "Name: A to Z": "name_asc", "Name: Z to A": "name_desc",
+    "File Size: Largest first": "logical_desc", "File Size: Smallest first": "logical_asc",
+    "Space Used: Largest first": "allocated_desc", "Space Used: Smallest first": "allocated_asc",
+}
 
 
 class _ScanProgress:
@@ -68,6 +75,10 @@ class SageApplication(tk.Tk):
         self._scan_started_at = 0.0
         self._size_started_at = 0.0
         self._mft_elapsed = 0.0
+        self._drive_capacity = {}
+        self._drive_refresh_job = None
+        self._drive_refresh_active = False
+        self._drive_refresh_closed = False
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -75,6 +86,7 @@ class SageApplication(tk.Tk):
         self.after(200, self._bring_to_front)
         self.after(300, self._warm_ai)
         self._load_volumes()
+        self._drive_refresh_job = self.after(400, self._refresh_drive_space)
 
     def _warm_ai(self) -> None:
         self.assistant_panel.set_status("Loading local AI…")
@@ -115,10 +127,37 @@ class SageApplication(tk.Tk):
 
         self._info_frame = ttk.Frame(self, style="Header.TFrame", padding=(18, 2, 18, 8))
         self._info_frame.pack(fill="x")
-        self._scan_info_var = tk.StringVar(value="")
-        self._volume_info_var = tk.StringVar(value="")
-        ttk.Label(self._info_frame, textvariable=self._scan_info_var, style="HeaderInfo.TLabel").pack(side="left")
-        ttk.Label(self._info_frame, textvariable=self._volume_info_var, style="HeaderInfo.TLabel").pack(side="right")
+        self._info_frame.columnconfigure(0, weight=1)
+        self._info_drive_var = tk.StringVar(value="Scan a drive to see its totals")
+        metrics = ttk.Frame(self._info_frame, style="Header.TFrame")
+        metrics.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+        ttk.Label(metrics, textvariable=self._info_drive_var,
+                  style="HeaderInfo.TLabel", anchor="center").grid(
+            row=0, column=0, columnspan=5, sticky="ew", pady=(0, 6))
+        self._metric_vars = {key: tk.StringVar(value='-') for key in
+                             ("capacity", "used", "free", "logical", "allocated")}
+        for column, (key, label) in enumerate((
+            ("capacity", "Drive Capacity"), ("used", "Used on Drive"), ("free", "Free on Drive"),
+            ("logical", "File Size (scan)"), ("allocated", "Space Used (scan)"),
+        )):
+            metrics.columnconfigure(column, weight=1, uniform="metrics")
+            ttk.Label(metrics, text=label, style="HeaderInfo.TLabel", anchor="center").grid(
+                row=1, column=column, sticky="ew")
+            ttk.Label(metrics, textvariable=self._metric_vars[key],
+                      style="HeaderField.TLabel", font=("Segoe UI Semibold", 18),
+                      width=1, anchor="center").grid(
+                row=2, column=column, sticky="ew", pady=(2, 0))
+        charts = ttk.Frame(self._info_frame, style="Header.TFrame")
+        charts.grid(row=0, column=1, sticky="nsew")
+        ttk.Label(charts, text='Drives: blue = used | green = free',
+                  style="HeaderInfo.TLabel").pack(anchor="center")
+        self._space_canvas = tk.Canvas(charts, width=306, height=68,
+                                       highlightthickness=0, background=SURFACE)
+        self._space_canvas.pack(fill="x")
+        self._space_scrollbar = ttk.Scrollbar(charts, orient="horizontal",
+                                              command=self._space_canvas.xview)
+        self._space_canvas.configure(xscrollcommand=self._space_scrollbar.set)
+        self._space_canvas.bind("<Configure>", lambda event: self._render_drive_space())
 
         ttk.Separator(self, orient="horizontal").pack(fill="x")
 
@@ -145,17 +184,17 @@ class SageApplication(tk.Tk):
         ttk.Label(left_header, text="Drive contents", style="Section.TLabel", padding=(16, 12, 16, 10)).grid(
             row=0, column=0, sticky="w"
         )
-        self._sort_var = tk.StringVar(value="Name A\u2013Z")
+        ttk.Label(left_header, text="Sort by", style="SurfaceMuted.TLabel").grid(
+            row=0, column=1, padx=(0, 6))
+        self._sort_var = tk.StringVar(value="Name: A to Z")
         self._sort_box = ttk.Combobox(
-            left_header, textvariable=self._sort_var, state="readonly", width=22,
-            values=["Name A\u2013Z", "Name Z\u2013A",
-                    "Logical size: largest", "Logical size: smallest",
-                    "Allocated size: largest", "Allocated size: smallest"]
+            left_header, textvariable=self._sort_var, state="readonly", width=25,
+            values=list(SORT_MODES),
         )
-        self._sort_box.grid(row=0, column=1, padx=(0, 8), pady=(4, 4))
+        self._sort_box.grid(row=0, column=2, padx=(0, 8), pady=(4, 4))
         self._sort_box.bind("<<ComboboxSelected>>", self._on_sort_changed)
         ttk.Separator(left, orient="horizontal").grid(row=1, column=0, sticky="ew")
-        self.tree_panel = TreePanel(left)
+        self.tree_panel = TreePanel(left, on_sort=self._sync_sort)
         self.tree_panel.grid(row=2, column=0, sticky="nsew")
         self.tree_panel.tree.bind("<<TreeviewSelect>>", self._on_tree_selected)
         self.tree_panel.tree.bind("<Button-3>", self._show_tree_menu)
@@ -260,6 +299,14 @@ class SageApplication(tk.Tk):
         try:
             while True:
                 event = self._events.get_nowait()
+                if event[0] == "drive_space":
+                    self._drive_capacity = event[1]
+                    self._drive_refresh_active = False
+                    self._update_drive_info()
+                    self._render_drive_space()
+                    if not self._drive_refresh_closed:
+                        self._drive_refresh_job = self.after(15000, self._refresh_drive_space)
+                    continue
                 if len(event) > 1 and event[1] != self._generation:
                     continue
                 kind = event[0]
@@ -702,45 +749,95 @@ class SageApplication(tk.Tk):
                 self.status_var.set("Copy finished — background size analysis continues.")
 
     def _on_sort_changed(self, _event: object = None) -> None:
-        mode_map = {
-            "Name A\u2013Z": "name_asc",
-            "Name Z\u2013A": "name_desc",
-            "Logical size: largest": "logical_desc",
-            "Logical size: smallest": "logical_asc",
-            "Allocated size: largest": "allocated_desc",
-            "Allocated size: smallest": "allocated_asc",
-        }
-        mode = mode_map.get(self._sort_var.get(), "name_asc")
-        self.tree_panel.apply_sort(mode)
+        self.tree_panel.apply_sort(SORT_MODES.get(self._sort_var.get(), "name_asc"))
 
     def _on_drive_changed(self, _event: object = None) -> None:
         self._clear_drive_info()
 
     def _update_drive_info(self) -> None:
-        """Refresh the header with scan totals and volume capacity."""
         result = self._result
         if result is None:
             self._clear_drive_info()
             return
+        self._info_drive_var.set(f"Scanned drive: {result.volume.display_name}")
+        for key in ("capacity", "used", "free"):
+            self._metric_vars[key].set("Unavailable")
+        capacity = self._drive_capacity.get(result.volume.drive)
+        if capacity is not None:
+            for key, value in zip(("capacity", "used", "free"), capacity):
+                self._metric_vars[key].set(format_bytes(value))
         if result.sizes_complete:
             logical, allocated = result.directory_sizes.get(result.root_frn, (0, 0))
-            self._scan_info_var.set(
-                f"Scan: {format_bytes(logical)} logical \u00b7 {format_bytes(allocated)} allocated"
-            )
+            self._metric_vars["logical"].set(format_bytes(logical))
+            self._metric_vars["allocated"].set(format_bytes(allocated))
         else:
-            self._scan_info_var.set("Scan sizes: measuring\u2026")
-        try:
-            total, used, free = get_disk_space(result.volume.drive)
-            self._volume_info_var.set(
-                f"Volume: {format_bytes(total)} capacity \u00b7 "
-                f"{format_bytes(used)} used \u00b7 {format_bytes(free)} free"
-            )
-        except OSError:
-            self._volume_info_var.set("")
+            self._metric_vars["logical"].set('Measuring...')
+            self._metric_vars["allocated"].set('Measuring...')
 
     def _clear_drive_info(self) -> None:
-        self._scan_info_var.set("")
-        self._volume_info_var.set("")
+        self._info_drive_var.set("Scan a drive to see its totals")
+        for variable in self._metric_vars.values():
+            variable.set('-')
+
+    def _sync_sort(self, mode: str) -> None:
+        self._sort_var.set(next(label for label, value in SORT_MODES.items() if value == mode))
+
+
+    def _render_drive_space(self) -> None:
+        """Draw read-only used/free pies using the existing background capacity data."""
+        canvas = self._space_canvas
+        canvas.delete("all")
+        width = max(306, len(self._volumes) * 102)
+        canvas.configure(scrollregion=(0, 0, width, 68))
+        if width > canvas.winfo_width():
+            self._space_scrollbar.pack(fill="x")
+        else:
+            self._space_scrollbar.pack_forget()
+        if not self._volumes:
+            canvas.create_text(153, 38, text="No fixed NTFS drives found", fill=TEXT_SECONDARY)
+        for index, volume in enumerate(self._volumes.values()):
+            x = index * 102 + 51
+            capacity = self._drive_capacity.get(volume.drive)
+            tag = f"drive:{volume.drive}"
+            if capacity is None or capacity[0] <= 0:
+                canvas.create_text(x, 10, text=volume.drive, fill=TEXT, tags=tag)
+                canvas.create_oval(x - 36, 20, x + 36, 48, fill="#E0E0E0", outline="", tags=tag)
+                canvas.create_text(x, 62, text="Unavailable", fill=TEXT_SECONDARY,
+                                   font=("Segoe UI", 9), tags=tag)
+                continue
+            total, used, free = capacity
+            fraction = max(0, min(1, free / total))
+            canvas.create_text(x, 10, text=f"{volume.drive} | {fraction * 100:.1f}% free",
+                               fill=TEXT, font=("Segoe UI", 8), tags=tag)
+            # Two ellipse layers give a shallow 3D appearance without a plotting dependency.
+            for offset, blue, green in ((6, "#084B86", "#176841"), (0, ACCENT, "#26945D")):
+                box = (x - 36, 20 + offset, x + 36, 48 + offset)
+                canvas.create_oval(*box, fill=blue, outline="", tags=(tag, "used"))
+                if fraction == 1:
+                    canvas.create_oval(*box, fill=green, outline="", tags=(tag, "free"))
+                elif fraction > 0:
+                    canvas.create_arc(*box, start=90, extent=fraction * 360, style="pieslice",
+                                      fill=green, outline="", tags=(tag, "free"))
+            canvas.create_text(x, 62, text=f"{format_bytes(free)} free", fill=TEXT_SECONDARY,
+                               font=("Segoe UI Semibold", 9), tags=tag)
+
+
+    def _refresh_drive_space(self) -> None:
+        """Read volume capacity off the UI thread for the display only."""
+        if self._drive_refresh_closed or self._drive_refresh_active:
+            return
+        self._drive_refresh_job = None
+        self._drive_refresh_active = True
+        volumes = tuple(self._volumes.values())
+        def worker():
+            capacities = {}
+            for volume in volumes:
+                try:
+                    capacities[volume.drive] = get_disk_space(volume.drive)
+                except OSError:
+                    pass
+            self._events.put(("drive_space", capacities))
+        threading.Thread(target=worker, daemon=True, name="sage-drive-graphics").start()
 
     def _close(self) -> None:
         if self._file_operation_running:
@@ -748,4 +845,7 @@ class SageApplication(tk.Tk):
             return
         self._scan_cancel.set()
         self._size_cancel.set()
+        self._drive_refresh_closed = True
+        if self._drive_refresh_job is not None:
+            self.after_cancel(self._drive_refresh_job)
         self.destroy()
