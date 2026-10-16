@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import urllib.error
-import urllib.request
 import queue
 import os
 import subprocess
@@ -21,7 +18,7 @@ from ..platform.windows.drives import get_disk_space, list_ntfs_volumes
 from ..platform.windows.file_operations import delete_permanently, empty_recycle_bin, shell_file_operation
 from ..services.cleanup import CleanupSuggestion, cleanup_report
 from ..services.evidence import EvidenceAssistant, format_bytes
-from ..services.local_ai import ConversationAssistant, OllamaClient, MODEL_NAME, OLLAMA_CHAT_URL
+from ..services.local_ai import ConversationAssistant, OllamaClient
 from ..services.scanner import analyze_sizes, scan_ntfs
 from .assistant_panel import AssistantPanel
 from .styles import ACCENT, SURFACE, TEXT, TEXT_SECONDARY, configure_styles
@@ -29,12 +26,9 @@ from .tree_panel import TreePanel
 
 
 SORT_MODES = {
-    "Name: A to Z": "name_asc",
-    "Name: Z to A": "name_desc",
-    "File Size: Largest first": "logical_desc",
-    "File Size: Smallest first": "logical_asc",
-    "Space Used: Largest first": "allocated_desc",
-    "Space Used: Smallest first": "allocated_asc",
+    "Name: A to Z": "name_asc", "Name: Z to A": "name_desc",
+    "File Size: Largest first": "logical_desc", "File Size: Smallest first": "logical_asc",
+    "Space Used: Largest first": "allocated_desc", "Space Used: Smallest first": "allocated_asc",
 }
 
 
@@ -81,9 +75,10 @@ class SageApplication(tk.Tk):
         self._scan_started_at = 0.0
         self._size_started_at = 0.0
         self._mft_elapsed = 0.0
-        self._drive_capacity: dict[str, tuple[int, int, int]] = {}
-        self._status_poll_active = False
-        self._status_poll_job: str | None = None
+        self._drive_capacity = {}
+        self._drive_refresh_job = None
+        self._drive_refresh_active = False
+        self._drive_refresh_closed = False
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -91,7 +86,7 @@ class SageApplication(tk.Tk):
         self.after(200, self._bring_to_front)
         self.after(300, self._warm_ai)
         self._load_volumes()
-        self._status_poll_job = self.after(400, self._refresh_ui_status)
+        self._drive_refresh_job = self.after(400, self._refresh_drive_space)
 
     def _warm_ai(self) -> None:
         self.assistant_panel.set_status("Loading local AI…")
@@ -139,7 +134,7 @@ class SageApplication(tk.Tk):
         ttk.Label(metrics, textvariable=self._info_drive_var,
                   style="HeaderInfo.TLabel", anchor="center").grid(
             row=0, column=0, columnspan=5, sticky="ew", pady=(0, 6))
-        self._metric_vars = {key: tk.StringVar(value="—") for key in
+        self._metric_vars = {key: tk.StringVar(value='-') for key in
                              ("capacity", "used", "free", "logical", "allocated")}
         for column, (key, label) in enumerate((
             ("capacity", "Drive Capacity"), ("used", "Used on Drive"), ("free", "Free on Drive"),
@@ -154,7 +149,7 @@ class SageApplication(tk.Tk):
                 row=2, column=column, sticky="ew", pady=(2, 0))
         charts = ttk.Frame(self._info_frame, style="Header.TFrame")
         charts.grid(row=0, column=1, sticky="nsew")
-        ttk.Label(charts, text="Drives: blue = used · green = free",
+        ttk.Label(charts, text='Drives: blue = used | green = free',
                   style="HeaderInfo.TLabel").pack(anchor="center")
         self._space_canvas = tk.Canvas(charts, width=306, height=68,
                                        highlightthickness=0, background=SURFACE)
@@ -191,9 +186,9 @@ class SageApplication(tk.Tk):
         )
         ttk.Label(left_header, text="Sort by", style="SurfaceMuted.TLabel").grid(
             row=0, column=1, padx=(0, 6))
-        self._sort_var = tk.StringVar(value="Space Used: Largest first")
+        self._sort_var = tk.StringVar(value="Name: A to Z")
         self._sort_box = ttk.Combobox(
-            left_header, textvariable=self._sort_var, state="disabled", width=25,
+            left_header, textvariable=self._sort_var, state="readonly", width=25,
             values=list(SORT_MODES),
         )
         self._sort_box.grid(row=0, column=2, padx=(0, 8), pady=(4, 4))
@@ -201,6 +196,7 @@ class SageApplication(tk.Tk):
         ttk.Separator(left, orient="horizontal").grid(row=1, column=0, sticky="ew")
         self.tree_panel = TreePanel(left, on_sort=self._sync_sort)
         self.tree_panel.grid(row=2, column=0, sticky="nsew")
+        self.tree_panel.tree.bind("<<TreeviewSelect>>", self._on_tree_selected)
         self.tree_panel.tree.bind("<Button-3>", self._show_tree_menu)
         self.tree_panel.tree.bind("<Double-1>", self._open_on_double_click)
         self.tree_panel.tree.bind("<Control-c>", self._copy_selection)
@@ -255,7 +251,6 @@ class SageApplication(tk.Tk):
             self.assistant_panel.finish_reply("The drive scan changed. Ask again once the new tree is ready.")
         self._assistant_busy = False
         self.tree_panel.clear()
-        self._sort_box.configure(state="disabled")
         self._clear_drive_info()
         self.progress_bar.stop()
         self.progress_bar.configure(mode="indeterminate")
@@ -304,14 +299,13 @@ class SageApplication(tk.Tk):
         try:
             while True:
                 event = self._events.get_nowait()
-                if event[0] == "ui_status":
-                    _, status, online, capacities = event
-                    self.assistant_panel.set_ai_status(status, online)
-                    self._drive_capacity = capacities
-                    self._status_poll_active = False
+                if event[0] == "drive_space":
+                    self._drive_capacity = event[1]
+                    self._drive_refresh_active = False
                     self._update_drive_info()
                     self._render_drive_space()
-                    self._status_poll_job = self.after(15_000, self._refresh_ui_status)
+                    if not self._drive_refresh_closed:
+                        self._drive_refresh_job = self.after(15000, self._refresh_drive_space)
                     continue
                 if len(event) > 1 and event[1] != self._generation:
                     continue
@@ -373,6 +367,8 @@ class SageApplication(tk.Tk):
                     if len(event) > 4 and event[4]:
                         self.assistant_panel.add_cleanup_actions(event[4], self._delete_suggestion)
                         self._conversation.remember_suggestions(event[4])
+                    if len(event) > 5 and event[5]:
+                        self.assistant_panel.add_open_buttons(event[5], self._open_settings)
                 elif kind == "assistant_token":
                     self.assistant_panel.append_reply(event[3])
                 elif kind == "assistant_status":
@@ -412,7 +408,7 @@ class SageApplication(tk.Tk):
             self._assistant_busy = False
         self._conversation = ConversationAssistant(result)
         self.tree_panel.show_result(result)
-        self._sort_box.configure(state="readonly")
+        self.assistant_panel.set_selected_item(None)
         self._update_drive_info()
         self.assistant_panel.write("SAGE", self._assistant.scan_summary())
         self.progress_bar.stop()
@@ -471,23 +467,30 @@ class SageApplication(tk.Tk):
         self._assistant_request_id += 1
         request_id = self._assistant_request_id
         generation = self._generation
+        selected_paths = tuple(self._selected_paths())
         self.assistant_panel.begin_reply()
 
         def worker() -> None:
             suggestions: list[CleanupSuggestion] = []
+            links: list[dict] = []
             try:
                 answer = conversation.answer(
-                    question, quoted=quoted,
+                    question, selected_paths, quoted=quoted,
                     on_token=lambda token: self._events.put(("assistant_token", generation, request_id, token)),
                     on_status=lambda status: self._events.put(("assistant_status", generation, request_id, status)),
                 )
                 suggestions = list(conversation.last_suggestions)
+                links = list(conversation.last_links)
             except Exception as exc:
                 answer = f"Could not answer from the current scan: {exc}"
-            self._events.put(("assistant_answer", generation, request_id, answer, suggestions))
+            self._events.put(("assistant_answer", generation, request_id, answer, suggestions, links))
 
         threading.Thread(target=worker, daemon=True, name="sage-local-ai").start()
         return None
+
+    def _on_tree_selected(self, _event: object = None) -> None:
+        paths = self._selected_paths()
+        self.assistant_panel.set_selected_item(paths[0] if len(paths) == 1 else None)
 
     def _selected_paths(self) -> list[str]:
         result = self._result
@@ -548,6 +551,9 @@ class SageApplication(tk.Tk):
         if record and not record.is_directory:
             self.tree_panel.tree.selection_set(iid)
             self._open_selection()
+
+    def _open_settings(self, target: str) -> None:
+        os.startfile(target)
 
     def _open_selection(self) -> None:
         paths = self._selected_paths()
@@ -743,14 +749,10 @@ class SageApplication(tk.Tk):
                 self.status_var.set("Copy finished — background size analysis continues.")
 
     def _on_sort_changed(self, _event: object = None) -> None:
-        self.tree_panel.apply_sort(SORT_MODES.get(self._sort_var.get(), "allocated_desc"))
-
-    def _sync_sort(self, mode: str) -> None:
-        self._sort_var.set(next(label for label, value in SORT_MODES.items() if value == mode))
+        self.tree_panel.apply_sort(SORT_MODES.get(self._sort_var.get(), "name_asc"))
 
     def _on_drive_changed(self, _event: object = None) -> None:
-        # The visible tree and its totals still belong to the last scanned drive.
-        self._update_drive_info()
+        self._clear_drive_info()
 
     def _update_drive_info(self) -> None:
         result = self._result
@@ -769,52 +771,17 @@ class SageApplication(tk.Tk):
             self._metric_vars["logical"].set(format_bytes(logical))
             self._metric_vars["allocated"].set(format_bytes(allocated))
         else:
-            self._metric_vars["logical"].set("Measuring…")
-            self._metric_vars["allocated"].set("Measuring…")
+            self._metric_vars["logical"].set('Measuring...')
+            self._metric_vars["allocated"].set('Measuring...')
 
     def _clear_drive_info(self) -> None:
         self._info_drive_var.set("Scan a drive to see its totals")
         for variable in self._metric_vars.values():
-            variable.set("—")
+            variable.set('-')
 
-    @staticmethod
-    def _read_ai_status() -> tuple[str, bool]:
-        """Check availability without generating a response or loading the model."""
-        url = OLLAMA_CHAT_URL.rsplit("/", 1)[0] + "/tags"
-        try:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(url, timeout=2) as response:
-                data = json.load(response)
-            models = data["models"]
-            if not isinstance(models, list):
-                raise ValueError("Invalid model list")
-            names = {model.get("name") or model.get("model") for model in models}
-            if MODEL_NAME not in names:
-                return "Online · model missing", True
-            return "Online", True
-        except (OSError, urllib.error.URLError, ValueError, KeyError, TypeError, AttributeError):
-            return "Offline", False
+    def _sync_sort(self, mode: str) -> None:
+        self._sort_var.set(next(label for label, value in SORT_MODES.items() if value == mode))
 
-    def _refresh_ui_status(self) -> None:
-        if self._status_poll_active:
-            return
-        if self._status_poll_job is not None:
-            self.after_cancel(self._status_poll_job)
-            self._status_poll_job = None
-        self._status_poll_active = True
-        volumes = tuple(self._volumes.values())
-
-        def worker() -> None:
-            status, online = self._read_ai_status()
-            capacities = {}
-            for volume in volumes:
-                try:
-                    capacities[volume.drive] = get_disk_space(volume.drive)
-                except OSError:
-                    pass
-            self._events.put(("ui_status", status, online, capacities))
-
-        threading.Thread(target=worker, daemon=True, name="sage-ui-status").start()
 
     def _render_drive_space(self) -> None:
         """Draw read-only used/free pies using the existing background capacity data."""
@@ -840,7 +807,7 @@ class SageApplication(tk.Tk):
                 continue
             total, used, free = capacity
             fraction = max(0, min(1, free / total))
-            canvas.create_text(x, 10, text=f"{volume.drive} · {fraction * 100:.1f}% free",
+            canvas.create_text(x, 10, text=f"{volume.drive} | {fraction * 100:.1f}% free",
                                fill=TEXT, font=("Segoe UI", 8), tags=tag)
             # Two ellipse layers give a shallow 3D appearance without a plotting dependency.
             for offset, blue, green in ((6, "#084B86", "#176841"), (0, ACCENT, "#26945D")):
@@ -854,12 +821,31 @@ class SageApplication(tk.Tk):
             canvas.create_text(x, 62, text=f"{format_bytes(free)} free", fill=TEXT_SECONDARY,
                                font=("Segoe UI Semibold", 9), tags=tag)
 
+
+    def _refresh_drive_space(self) -> None:
+        """Read volume capacity off the UI thread for the display only."""
+        if self._drive_refresh_closed or self._drive_refresh_active:
+            return
+        self._drive_refresh_job = None
+        self._drive_refresh_active = True
+        volumes = tuple(self._volumes.values())
+        def worker():
+            capacities = {}
+            for volume in volumes:
+                try:
+                    capacities[volume.drive] = get_disk_space(volume.drive)
+                except OSError:
+                    pass
+            self._events.put(("drive_space", capacities))
+        threading.Thread(target=worker, daemon=True, name="sage-drive-graphics").start()
+
     def _close(self) -> None:
         if self._file_operation_running:
             messagebox.showinfo(APP_NAME, "Wait for the current Windows file operation to finish.")
             return
         self._scan_cancel.set()
         self._size_cancel.set()
-        if self._status_poll_job is not None:
-            self.after_cancel(self._status_poll_job)
+        self._drive_refresh_closed = True
+        if self._drive_refresh_job is not None:
+            self.after_cancel(self._drive_refresh_job)
         self.destroy()

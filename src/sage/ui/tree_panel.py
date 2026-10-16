@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
-from collections.abc import Callable
 
 from ..models import FileRecord, ScanResult
 from ..services.evidence import attributes_text, format_bytes
@@ -13,22 +12,21 @@ from ..services.evidence import attributes_text, format_bytes
 class TreePanel(ttk.Frame):
     COLUMNS = ("allocated", "logical", "items", "files", "folders", "attrs")
 
-    def __init__(self, parent: tk.Misc, on_sort: Callable[[str], None] | None = None) -> None:
+    def __init__(self, parent: tk.Misc, on_sort=None) -> None:
         super().__init__(parent, style="Surface.TFrame")
         self.result: ScanResult | None = None
-        self._sort_mode = "allocated_desc"
+        self._sort_mode = "name_asc"
         self._on_sort = on_sort
         self.folder_icon, self.file_icon, self.drive_icon = self._make_icons()
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        # Selection is visual navigation only; questions never receive tree selection.
-        self.tree = ttk.Treeview(self, columns=self.COLUMNS, show="tree headings",
-                                 selectmode="browse", style="Navigation.Treeview")
+        # One click selects the folder the next question is about.
+        self.tree = ttk.Treeview(self, columns=self.COLUMNS, show="tree headings", selectmode="browse")
         self.tree.heading("#0", text="Name", anchor="w")
         headings = {
-            "allocated": "Space Used ↕",
-            "logical": "File Size ↕",
+            "allocated": "Space Used",
+            "logical": "File Size",
             "items": "Items",
             "files": "Files",
             "folders": "Folders",
@@ -39,10 +37,9 @@ class TreePanel(ttk.Frame):
 
         for column, field in (("#0", "name"), ("logical", "logical"), ("allocated", "allocated")):
             self.tree.heading(column, command=lambda field=field: self._toggle_sort(field))
-
         self.tree.column("#0", width=240, minwidth=180, stretch=True)
-        self.tree.column("allocated", width=110, anchor="e")
-        self.tree.column("logical", width=110, anchor="e")
+        self.tree.column("allocated", width=100, anchor="e")
+        self.tree.column("logical", width=100, anchor="e")
         self.tree.column("items", width=80, anchor="e")
         self.tree.column("files", width=80, anchor="e")
         self.tree.column("folders", width=75, anchor="e")
@@ -58,7 +55,6 @@ class TreePanel(ttk.Frame):
 
     def clear(self) -> None:
         self.result = None
-        self.apply_sort("allocated_desc")
         self.tree.delete(*self.tree.get_children(""))
 
     def selected_frns(self) -> list[int]:
@@ -86,8 +82,6 @@ class TreePanel(ttk.Frame):
         return folder, file, drive
 
     def show_result(self, result: ScanResult) -> None:
-        self.result = None
-        self.apply_sort("allocated_desc")
         self.result = result
         self.tree.delete(*self.tree.get_children(""))
         root = result.records[result.root_frn]
@@ -121,80 +115,97 @@ class TreePanel(ttk.Frame):
                 self.tree.item(iid, values=self._values(record))
             pending.extend(self.tree.get_children(iid))
 
-        if self._sort_mode.startswith(("logical", "allocated")):
-            self._resort_subtree(self._iid(self.result.root_frn))
-
     # ── Sorting ───────────────────────────────────────────────────────
 
     def _toggle_sort(self, field: str) -> None:
         if self.result is None:
             return
-        first = "asc" if field == "name" else "desc"
-        mode = f"{field}_{first}"
-        if self._sort_mode.startswith(field + "_"):
-            mode = f"{field}_{'desc' if self._sort_mode.endswith('_asc') else 'asc'}"
-        self.apply_sort(mode)
+        direction = "asc" if field == "name" else "desc"
+        if self._sort_mode.startswith(field+"_"):
+            direction = "desc" if self._sort_mode.endswith("_asc") else "asc"
+        self.apply_sort(field+"_"+direction)
 
     def apply_sort(self, mode: str) -> None:
-        """Sort only loaded rows; retain lazy loading and the original scan order."""
-        if mode not in {"scan", "name_asc", "name_desc", "logical_asc", "logical_desc",
-                        "allocated_asc", "allocated_desc"}:
-            raise ValueError(f"Unknown sort mode: {mode}")
+        """Change sort mode and re-sort all currently loaded tree items."""
         self._sort_mode = mode
-        for column, field, label in (("#0", "name", "Name"),
-                                     ("logical", "logical", "File Size"),
-                                     ("allocated", "allocated", "Space Used")):
-            arrow = " ↕" if field in {"logical", "allocated"} else ""
-            if mode.startswith(field + "_"):
-                arrow = " ↑" if mode.endswith("_asc") else " ↓"
-            self.tree.heading(column, text=label + arrow)
+        for column, field, label in (("#0", "name", "Name"), ("logical", "logical", "File Size"), ("allocated", "allocated", "Space Used")):
+            suffix = ""
+            if mode.startswith(field+"_"):
+                suffix = " \u2191" if mode.endswith("_asc") else " \u2193"
+            self.tree.heading(column, text=label+suffix)
         if self._on_sort:
             self._on_sort(mode)
-        if self.result is not None:
-            self._resort_subtree(self._iid(self.result.root_frn))
+        if self.result is None:
+            return
+        for root_iid in self.tree.get_children(""):
+            self._resort_subtree(root_iid)
 
     def _sort_children(self, child_frns: list[int]) -> list[int]:
-        if self.result is None or self._sort_mode == "scan":
+        """Sort a list of child FRNs according to the current sort mode.
+
+        Folders always appear before files.  Missing size values are
+        treated as 0 so that sorting never crashes.
+        """
+        if self.result is None:
             return child_frns
+
         records = self.result.records
+        dir_sizes = self.result.directory_sizes
         mode = self._sort_mode
-        reverse = mode.endswith("_desc")
-        if mode.startswith("name"):
-            folders = [frn for frn in child_frns if records[frn].is_directory]
-            files = [frn for frn in child_frns if not records[frn].is_directory]
-            key = lambda frn: records[frn].name.casefold()
-            return sorted(folders, key=key, reverse=reverse) + sorted(files, key=key, reverse=reverse)
 
-        ready, pending = [], []
+        folders: list[int] = []
+        files: list[int] = []
         for frn in child_frns:
-            record = records[frn]
-            measured = (self.result.sizes_complete or self.result.stats.get(frn, (0, 0, 0))[1] == 0
-                        if record.is_directory else record.size_ready and not record.size_error)
-            (ready if measured else pending).append(frn)
+            r = records.get(frn)
+            if r is None:
+                continue
+            (folders if r.is_directory else files).append(frn)
 
-        def size_key(frn: int) -> tuple[int, str]:
-            record = records[frn]
-            logical, allocated = (self.result.directory_sizes.get(frn, (0, 0))
-                                  if record.is_directory else (record.logical_size, record.allocated_size))
-            return (logical if mode.startswith("logical") else allocated, record.name.casefold())
+        reverse = mode.endswith("_desc")
 
-        return sorted(ready, key=size_key, reverse=reverse) + pending
+        def _key(frn: int) -> tuple:
+            r = records[frn]
+            if mode.startswith("name"):
+                return (r.name.casefold(),)
+            if mode.startswith("logical"):
+                size = dir_sizes.get(r.frn, (0, 0))[0] if r.is_directory else r.logical_size
+                # Secondary sort by name for stability
+                return (size, r.name.casefold())
+            if mode.startswith("allocated"):
+                size = dir_sizes.get(r.frn, (0, 0))[1] if r.is_directory else r.allocated_size
+                return (size, r.name.casefold())
+            return (r.name.casefold(),)
+
+        folders.sort(key=_key, reverse=reverse)
+        files.sort(key=_key, reverse=reverse)
+        return folders + files
 
     def _resort_subtree(self, parent_iid: str) -> None:
-        """Reorder loaded children without loading folders or losing selection."""
-        pending = [parent_iid]
-        while pending:
-            parent = pending.pop()
-            items = {int(iid.split(":", 1)[1]): iid
-                     for iid in self.tree.get_children(parent) if iid.startswith("frn:")}
-            if not items:
-                continue
-            parent_frn = int(parent.split(":", 1)[1])
-            original = [frn for frn in self.result.children.get(parent_frn, ()) if frn in items]
-            for index, frn in enumerate(self._sort_children(original)):
-                self.tree.move(items[frn], parent, index)
-            # Include cached collapsed folders, but never populate their dummy rows.
-            pending.extend(items.values())
+        """Re-order loaded children of *parent_iid* using tree.move()."""
+        children = list(self.tree.get_children(parent_iid))
+        if not children:
+            return
+
+        frn_items: list[tuple[str, int]] = []
+        for iid in children:
+            if iid.startswith("frn:"):
+                frn_items.append((iid, int(iid.split(":", 1)[1])))
+
+        if not frn_items:
+            return
+
+        sorted_frns = self._sort_children([frn for _, frn in frn_items])
+        frn_to_iid = {frn: iid for iid, frn in frn_items}
+
+        for index, frn in enumerate(sorted_frns):
+            iid = frn_to_iid.get(frn)
+            if iid:
+                self.tree.move(iid, parent_iid, index)
+
+        # Recurse into expanded children only
+        for iid in self.tree.get_children(parent_iid):
+            if iid.startswith("frn:") and self.tree.item(iid, "open"):
+                self._resort_subtree(iid)
 
     # ── Internal ──────────────────────────────────────────────────────
 
