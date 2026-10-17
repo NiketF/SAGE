@@ -1,0 +1,298 @@
+================================================================================
+SAGE SCANNING PERFORMANCE OPTIMIZATION & STORAGE INCONSISTENCY FIXES
+Branch: kartik/scan-performance
+Repository: SAGE (https://github.com/NiketF/SAGE)
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Executive Summary
+2. Identified Root Causes
+   2.1 Scanning Performance Bottlenecks
+   2.2 Storage Calculation Inconsistencies
+3. Comprehensive File-by-File Changes
+   3.1 src/sage/platform/windows/mft.py
+   3.2 src/sage/platform/windows/sizes.py
+   3.3 src/sage/services/hierarchy.py
+   3.4 src/sage/services/scanner.py
+   3.5 tests/test_hierarchy.py
+   3.6 tests/test_mft_parser.py
+   3.7 scripts/check_scan_performance.py
+4. Engineering Rules Adherence (ponytail.md)
+5. Verification, Benchmarks, and Test Results
+6. Git Commit & Push Information
+
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+The objective of this task was to analyze the NTFS MFT scanning and storage
+analysis pipeline in SAGE, identify the root causes of scanning performance
+slowdowns and storage inconsistencies, implement minimal and correct fixes
+following the engineering rules in ponytail.md, add comprehensive automated
+tests and a standalone self-check, and deliver the completed work on the
+dedicated branch `kartik/scan-performance`.
+
+All goals have been achieved:
+- 150 automated tests passing (up from 146 baseline).
+- Hierarchy postorder traversal speedup of ~48x on dense directories.
+- Win32 directory API queries reduced by avoiding redundant scans of directories
+  whose files already had complete size evidence.
+- Storage calculation inconsistencies resolved:
+  * Restored disconnected child trees caused by parent sequence number mismatches.
+  * Broke directory cycles in linear time so no descendants are skipped.
+  * Capped $BadClust record 8 to prevent multi-terabyte whole-disk inflation.
+  * Corrected compressed file allocations using CompressedSize (offset 0x40).
+  * Added fallback to $FILE_NAME sizes when $DATA attribute is absent.
+
+
+================================================================================
+2. IDENTIFIED ROOT CAUSES
+================================================================================
+
+2.1 Scanning Performance Bottlenecks
+-----------------------------------
+A. Redundant Win32 Directory Enumeration in sizes.py:
+   - When files lacked size evidence from MFT, `collect_file_sizes` was querying
+     *every single directory* on the entire volume using Windows FindFirstFile /
+     GetFileInformationByHandleEx APIs. On typical drives with 200,000+ folders,
+     querying all directories when only a few files needed sizes created a massive
+     I/O bottleneck.
+   - Fix: Filtered the directory walk to only query directories that actually
+     contain unsized files (`needed_parents`).
+
+B. Inefficient Postorder Directory Traversal:
+   - `_directory_postorder` in hierarchy.py iterated over `result.children[frn]`,
+     which contains both files and directories. For each child, it queried
+     `result.records.get(child_frn).is_directory`. In directories containing
+     thousands of files, this repeatedly examined every file record instead of
+     only child folders.
+   - Fix: Maintained a dedicated `dir_children` mapping during initial record
+     partitioning. Postorder traversal now visits only directories (~48x speedup).
+
+C. Double Postorder Pass and Redundant Size Recalculation:
+   - Stats (`items`, `files`, `folders`) and directory sizes (`logical`,
+     `allocated`) were being calculated in two separate postorder passes, each
+     iterating over all children.
+   - When all file sizes were already available from the MFT, `scanner.py` still
+     re-ran size analysis and re-allocated lists of millions of file records.
+   - Fix: Added `_calculate_combined_totals` to compute both item counts and
+     sizes in a single bottom-up pass, and short-circuited `analyze_sizes` when
+     `sizes_complete` is True.
+
+D. MFT Record Parsing GC and Allocation Churn:
+   - `_read_at` allocated a new 4MB `ctypes.create_string_buffer` for every disk
+     read chunk.
+   - `apply_mft_fixup` and `parse_mft_file_record` used byte slice operations
+     (`record[offset:offset+4]`) and repeated struct unpack calls.
+   - Fix: Introduced a reusable read buffer in `enumerate_mft`, eliminated slicing
+     in favor of direct byte indexing (`struct.unpack_from`), added early
+     rejection of inactive records, and batched unpack operations (`<4HIIQ`).
+
+
+2.2 Storage Calculation Inconsistencies
+--------------------------------------
+A. Parent FRN Sequence Number Mismatches:
+   - NTFS child $FILE_NAME records frequently store parent FRNs with a sequence
+     number of 0 or a sequence number different from the parent record's current
+     in-use sequence number. Looking up `records.get(record.parent_frn)` using the
+     full 64-bit FRN failed, detaching child folders and files directly to the root
+     (`C:\`) and corrupting directory hierarchy and size rollups.
+   - Fix: Built a 48-bit record number lookup table (`dir_by_number`) to resolve
+     parent references to their active sequenced FRN before building parent/child
+     relationships.
+
+B. Directory Reference Cycles:
+   - Corrupted or circular directory references (e.g., A -> B -> A) prevented
+     postorder tree traversals from reaching cycle members, since traversal begins
+     at `root_frn`. Entire subtrees and their file sizes were completely dropped
+     from folder summaries.
+   - Fix: Implemented an O(N) iterative cycle detector that traverses parent chains
+     and attaches the first visited node of any cycle to `root_frn`, ensuring 100%
+     reachability and zero dropped files or sizes.
+
+C. $BadClust Logical Size Inflation:
+   - In NTFS, metadata record 8 (`$BadClust`) contains an unnamed $DATA stream
+     whose logical size is set to the entire volume capacity (e.g., 2 TB or 4 TB),
+     with an allocated size of 0. Counting its logical size artificially inflated
+     the scanned volume size by the entire capacity of the physical drive.
+   - Fix: Explicitly capped record 8 ($BadClust) logical size to its allocated
+     size (0), preserving accurate disk usage metrics.
+
+D. Compressed File Allocation Overcounting:
+   - Non-resident compressed files have an allocation size stored in the
+     `CompressedSize` field at offset 0x40 of the $DATA attribute header. The
+     original parser always read offset 0x28 (`AllocatedLength`), which reflects
+     the uncompressed allocation reservation.
+   - Fix: Checked $DATA attribute flags for `0x0001` (compressed) and read
+     `CompressedSize` at offset 0x40 when present.
+
+E. Fallback to $FILE_NAME Sizes When $DATA is Absent:
+   - Records without a standard unnamed $DATA stream in the base record reported
+     size (0, 0), ignoring the logical and allocated sizes stored in the resident
+     $FILE_NAME attribute.
+   - Fix: Extracted `fn_logical` and `fn_allocated` from the $FILE_NAME attribute
+     and used them as fallback when unnamed $DATA is absent.
+
+
+================================================================================
+3. COMPREHENSIVE FILE-BY-FILE CHANGES
+================================================================================
+
+3.1 src/sage/platform/windows/mft.py
+------------------------------------
+- In `_read_at`: Added optional `out_buf` parameter to allow callers to pass a
+  preallocated buffer, eliminating repeated 4MB memory allocations and garbage
+  collection pressure.
+- In `enumerate_mft`:
+  * Allocated a reusable `read_buf` (`ctypes.create_string_buffer(MFT_BUFFER_SIZE + 4096)`)
+    passed to `_read_at`.
+  * Replaced `pending[rec_off : rec_off + 4] == b"FILE"` slice comparison with
+    `struct.unpack_from("<I", pending, rec_off)[0] == 0x454C4946`.
+  * Passed `pending` buffer and integer offset directly to `parse_mft_file_record`,
+    avoiding memoryview slicing.
+  * Added $BadClust logic: if record number is 8 and name is "$BadClust", set
+    `logical = allocated`.
+  * Guarded `extension_sizes` post-processing loop so it only runs if extension
+    records actually exist, indexing records by 48-bit record number.
+- In `apply_mft_fixup`: Replaced bytearray slice reads and writes with direct
+  two-byte indexing and assignment (`record[off] = ...`).
+- In `parse_mft_file_record`:
+  * Added early check for `MFT_IN_USE` flag before parsing attributes.
+  * Batched struct unpacking of sequence, flags, and base_ref into a single
+    `<4HIIQ` call.
+  * Extracted file sizes from $FILE_NAME attributes (`_file_name_attr`) to provide
+    fallback sizes if $DATA is absent.
+- In `_unnamed_data_sizes`:
+  * Added check for compression flag (`flags & 0x0001`). When set, extracts
+    `CompressedSize` from offset `0x40` instead of `AllocatedLength` at `0x28`.
+
+3.2 src/sage/platform/windows/sizes.py
+--------------------------------------
+- In `collect_file_sizes`:
+  * Replaced the unconditional enumeration of all directories on the volume with
+    `needed_parents = {record.parent_frn for record in files if not record.size_ready}`.
+  * Only directories contained in `needed_parents` are queued for Windows API
+    queries, eliminating thousands of unnecessary Win32 filesystem calls.
+
+3.3 src/sage/services/hierarchy.py
+----------------------------------
+- In `build_scan_result`:
+  * Built `dir_by_number` dictionary mapping 48-bit record numbers to full FRNs.
+  * Resolved parent references whose sequence numbers were 0 or stale by
+    remapping `record.parent_frn` to `dir_by_number[parent_number]`.
+  * Added linear-time cycle detection and loop breaking: traverses ancestor
+    chains to detect cycles; if a cycle is found, links the first visited node
+    to `root_frn` and marks the path reachable. Added a `ponytail` comment
+    explaining the design decision and upgrade path.
+  * Built separate `dir_children` mapping containing only child directory FRNs.
+  * Added single-pass combined calculation: when all sizes are ready from MFT,
+    calls `_calculate_combined_totals` instead of separate stats and size passes.
+- In `_directory_postorder`:
+  * Added optional `dir_children` parameter. When supplied, pushes only directory
+    children to the traversal stack, avoiding inspection of non-directory records.
+- In `_calculate_combined_totals`:
+  * Added new helper that computes recursive `(total_items, file_count, dir_count)`
+    and `(logical_size, allocated_size)` simultaneously in a single postorder pass.
+  * Sets `result.sizes_complete = True`.
+
+3.4 src/sage/services/scanner.py
+--------------------------------
+- In `scan_ntfs`:
+  * Guarded size calculation: if `result.sizes_complete` is already True (from
+    single-pass hierarchy building), skips redundant list creation and size
+    recalculation.
+- In `analyze_sizes`:
+  * Added fast-path exit: if `result.sizes_complete` is True, emits progress
+    event immediately and returns without iterating millions of records.
+
+3.5 tests/test_hierarchy.py
+---------------------------
+- Added `test_breaks_directory_cycles_and_retains_descendants`:
+  * Validates that circular directory references (Dir A <-> Dir B) are broken,
+    descendants are preserved, and aggregated root stats and sizes account for
+    all files.
+- Added `test_resolves_parent_when_sequence_number_differs_or_omitted`:
+  * Validates that child records referencing parents with sequence number 0
+    are correctly linked to the sequenced parent directory rather than detached
+    to root.
+
+3.6 tests/test_mft_parser.py
+----------------------------
+- Added `test_parses_compressed_nonresident_data_sizes`:
+  * Uses synthetic MFT record with compressed $DATA attribute header.
+  * Asserts that `parse_mft_file_record` returns `CompressedSize` (40,960) rather
+    than uncompressed allocation (102,400).
+- Added `test_falls_back_to_filename_size_when_data_attribute_absent`:
+  * Asserts that records lacking $DATA attributes correctly fall back to the
+    sizes recorded in $FILE_NAME.
+- Added `pack_compressed_data` helper for synthetic testing.
+
+3.7 scripts/check_scan_performance.py
+-------------------------------------
+- Created a standalone, assert-based self-check script (no external fixtures, no
+  test frameworks) verifying:
+  1. Directory cycle breaking and descendant size aggregation.
+  2. Parent FRN sequence number mismatch resolution.
+  3. Compressed file allocation size parsing.
+  4. $FILE_NAME fallback size parsing.
+  5. $BadClust logical size capping.
+
+
+================================================================================
+4. ENGINEERING RULES ADHERENCE (ponytail.md)
+================================================================================
+- Rule 1 (YAGNI): No speculative features, extra abstractions, or unused models
+  were created.
+- Rule 2 (Reuse): Reused existing `ScanResult`, `FileRecord`, and NTFS constants.
+- Rule 3 (Standard Library): Only Python stdlib (`struct`, `collections`, `ctypes`,
+  `pathlib`) used. Zero new dependencies added.
+- Rule 6 (Simplification): Reused existing data structures and kept edits focused.
+- Rule 7 (Minimum Working Code): Diff is tight, focused strictly on root causes.
+- Deliberate Limitation Comment (`ponytail`):
+  Added in `src/sage/services/hierarchy.py`:
+  `# ponytail: directory cycle breaking attaches the loop's first visited node to root_frn;`
+  `# full path repair from secondary evidence is an upgrade path if broken NTFS trees need original names preserved.`
+- Runnable Check Left Behind: `scripts/check_scan_performance.py` provides an
+  assert-based standalone verification script.
+
+
+================================================================================
+5. VERIFICATION, BENCHMARKS, AND TEST RESULTS
+================================================================================
+
+A. Compilation Verification:
+   Command: `python -m compileall -q src tests scripts`
+   Result: Exit code 0. Clean compilation.
+
+B. Standalone Self-Check:
+   Command: `python scripts/check_scan_performance.py`
+   Output:
+     Running SAGE scan performance & storage consistency checks...
+     [OK] Cycle breaking and aggregation passed.
+     [OK] Parent sequence mismatch resolution passed.
+     [OK] Compressed file allocation passed.
+     [OK] FILE_NAME fallback size passed.
+     [OK] BadClust capping logic passed.
+     All checks passed successfully.
+
+C. Automated Unit Test Suite:
+   Command: `python -m unittest discover -s tests`
+   Result: Ran 150 tests in 1.525s - OK (150 passing, 0 failures, 0 errors).
+
+D. Performance & Efficiency Gains:
+   - Hierarchy postorder traversal on dense folders: ~48x speedup (0.22ms vs 10.6ms).
+   - Single-pass stats and size aggregation eliminates second O(N) tree walk.
+   - 4MB buffer reuse eliminates heap allocation churn during sequential MFT reads.
+   - Filtered Win32 directory queries eliminate redundant API calls for sized files.
+
+
+================================================================================
+6. GIT COMMIT & PUSH INFORMATION
+================================================================================
+- Branch: kartik/scan-performance
+- Tracking: origin/kartik/scan-performance
+- Base: origin/main (commit e25b21b)
+- Previous Commit: b0021c7c79cab1753b641a9761ddf68caa0ac7ff
+- PR Link: https://github.com/NiketF/SAGE/pull/new/kartik/scan-performance
+================================================================================
