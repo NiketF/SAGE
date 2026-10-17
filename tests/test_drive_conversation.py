@@ -103,6 +103,75 @@ class IndexTests(unittest.TestCase):
 
 
 class ToolTests(unittest.TestCase):
+    def test_tree_inspection_covers_nested_mixed_contents_without_opening_files(self):
+        result=scan({'Work/raw/video.mp4':400,'Work/code/src/start.py':30,
+                     'Work/code/settings.json':20,'Work/empty/':0,'Other/unrelated.exe':500})
+        evidence=ScanEvidence(result)
+        with patch.object(evidence,'_read_excerpt',side_effect=AssertionError('Metadata only')):
+            tree=evidence.tree_summary(r'E:\Work')
+        self.assertFalse(tree['partial'])
+        self.assertEqual(tree['files_observed'],3)
+        self.assertEqual(tree['subfolders_observed'],4)
+        self.assertEqual({row['extension'] for row in tree['file_types']},{'.mp4','.py','.json'})
+        self.assertNotIn('unrelated.exe',json.dumps(tree))
+        self.assertEqual(tree['scanned_totals']['files'],3)
+
+    def test_tree_limits_never_present_a_sample_as_a_full_inspection(self):
+        evidence=ScanEvidence(scan({f'Wide/f{i}.bin':10 for i in range(30)}))
+        limited=evidence.tree_summary(r'E:\Wide',max_records=5)
+        self.assertTrue(limited['partial'])
+        self.assertLessEqual(limited['records_checked'],5)
+        self.assertEqual(limited['scanned_totals']['files'],30)
+        timed=evidence.tree_summary(r'E:\Wide',seconds=0)
+        self.assertTrue(timed['partial'])
+        self.assertEqual(timed['records_checked'],0)
+
+    def test_tree_does_not_follow_links_or_loop_on_repeated_records(self):
+        result=scan({'Work/Link/target.txt':10,'Work/normal.txt':10})
+        link=next(r for r in result.records.values() if r.name=='Link')
+        link.attributes |= 0x400
+        result.children[link.parent_frn].append(link.parent_frn)
+        tree=ScanEvidence(result).tree_summary(r'E:\Work')
+        self.assertTrue(tree['partial'])
+        self.assertEqual(tree['unfollowed_links'],1)
+        self.assertEqual(tree['missing_or_repeated_records'],1)
+        self.assertNotIn('target.txt',json.dumps(tree))
+
+    def test_file_inspection_retains_type_attributes_and_unknown_measurements(self):
+        result=scan({'Work/item.dat':10})
+        record=next(r for r in result.records.values() if r.name=='item.dat')
+        record.attributes |= 1|2|0x4000
+        record.size_ready=False
+        tree=ScanEvidence(result).tree_summary(r'E:\Work\item.dat')
+        self.assertEqual(tree['files_with_unknown_size'],1)
+        self.assertEqual(tree['file_types'][0]['example_space'],'pending')
+        self.assertEqual(tree['attributes_observed'],{'read_only_attribute':1,'hidden':1,'encrypted':1})
+        self.assertEqual(tree['modified_date'],'1970-01-01')
+        self.assertEqual(tree['subfolders_observed'],0)
+
+    def test_tree_cache_is_invalidated_when_size_progress_changes(self):
+        evidence=ScanEvidence(scan({'Folder/file.txt':10}))
+        first=evidence.tree_summary(r'E:\Folder')
+        self.assertIs(first,evidence.tree_summary(r'E:\Folder'))
+        evidence.result.sizes_complete=False
+        self.assertIsNot(first,evidence.tree_summary(r'E:\Folder'))
+
+    def test_tree_inspection_does_not_change_c_cleanup_candidates(self):
+        result=scan({'Users/Test/AppData/Local/Temp/a.tmp':10},drive='C:')
+        registry=ToolRegistry(ScanEvidence(result),None)
+        expected=registry.call('cleanup_candidates',{})
+        with patch.object(registry.evidence,'_read_excerpt',return_value={'status':'not_read'}):
+            registry.call('inspect_path',{'path':r'C:\Users\Test\AppData\Local\Temp'})
+        self.assertEqual(registry.call('cleanup_candidates',{}),expected)
+
+    def test_empty_tree_is_evidence_not_a_safety_decision(self):
+        evidence=ScanEvidence(scan({'Empty/':0}))
+        tree=evidence.tree_summary(r'E:\Empty')
+        self.assertEqual(tree['files_observed'],0)
+        self.assertFalse(tree['partial'])
+        self.assertNotIn('safe',tree)
+        self.assertIn('No active-use',tree['limits'])
+
     def setUp(self):
         self.evidence=ScanEvidence(scan({'Alpha/a.txt':10,'Beta/b.txt':10}))
         self.tools=ToolRegistry(self.evidence,None)
@@ -185,9 +254,61 @@ class ToolTests(unittest.TestCase):
 
 
 class ConversationTests(unittest.TestCase):
-    def make_assistant(self, transport):
+    def test_path_checks_accept_matching_quotes_without_accepting_new_suffixes(self):
+        known={r'e:\toolbox'}
+        for text in ['References point to "E:\\Toolbox".', "References point to 'E:\\Toolbox'."]:
+            self.assertTrue(paths_verified(text,known))
+        for text in ['References point to "E:\\Toolbox.bak".', "References point to E:\\Toolbox'."]:
+            self.assertFalse(paths_verified(text,known))
+
+    def test_all_change_wordings_receive_inspected_evidence_before_model_answer(self):
+        questions=['Can I delete this?','Would getting rid of this cause problems?',
+                   'Should I update this?','Can I edit its settings?', 'Can I replace this?',
+                   'What if I move it to another drive?', 'Can I rename it?',
+                   'Would unpacking it affect my work?','Can I change this?']
+        for question in questions:
+            with self.subTest(question=question):
+                received=[]
+                def transport(payload):
+                    received.append(payload)
+                    return {'message':{'content':json.dumps({'purpose':'This folder contains a video.',
+                        'answer':'Review its use before changes. No file was changed.'})}}
+                a=self.make_assistant(transport)
+                reply=a.answer(question,(r'E:\Media',))
+                context=json.loads(received[0]['messages'][-1]['content'].split('Drive evidence: ',1)[1])
+                tree=context['selected_items'][0]['tree_evidence']
+                self.assertEqual(tree['file_types'][0]['extension'],'.mp4')
+                self.assertFalse(tree['partial'])
+                self.assertEqual(a.last_timings['model_calls'],1)
+                self.assertEqual(reply.count('No file was changed.'),1)
+
+    def test_search_discovery_is_inspected_before_the_model_gives_advice(self):
+        received=[]
+        def transport(payload):
+            received.append(payload)
+            return tool('search_files',{'query':'config.json'}) if len(received)==1 else {
+                'message':{'content':json.dumps({'purpose':'This JSON file may store settings.',
+                    'answer':'Check its reader before changing it.'})}}
+        a=self.make_assistant(transport)
+        a.answer('Would changing the project configuration affect anything?')
+        result=json.loads(received[-1]['messages'][-1]['content'].split(': ',1)[1])
+        item=result['inspected_items'][0]
+        self.assertEqual(item['path'],r'E:\Project\config.json')
+        self.assertEqual(item['tree_evidence']['file_types'][0]['extension'],'.json')
+        self.assertEqual(a.last_timings['model_calls'],2)
+
+    def test_paths_from_nested_tree_evidence_can_be_used_in_the_response(self):
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({
+            'purpose':'The folder contains footage.',
+            'answer':'Review `E:\\Media\\Sub\\Nested\\clip.mp4` before changes.'})}},
+            names={'Media/Sub/Nested/clip.mp4':1000})
+        reply=a.answer('What can I change here?',(r'E:\Media',))
+        self.assertIn(r'E:\Media\Sub\Nested\clip.mp4',reply)
+        self.assertEqual(a.last_timings['status'],'model_answer')
+
+    def make_assistant(self, transport, names=None):
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
-        return DriveAssistant(scan({'Project/config.json':100,'Media/clip.mp4':1000}),
+        return DriveAssistant(scan(names or {'Project/config.json':100,'Media/clip.mp4':1000}),
             OllamaClient(transport=transport),DriveIndex(str(Path(temp.name)/'index.sqlite3')))
 
     def test_model_gets_equivalent_wordings_without_keyword_gate(self):

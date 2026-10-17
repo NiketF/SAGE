@@ -101,7 +101,7 @@ class ToolRegistry:
         fields.update({key:{'type':'string'} for key in ('after_date','before_date')})
         descriptions={
             'report_fact':'Look up size/date/count. Set final=true ONLY for a pure fact question, never cleanup/impact advice. Omit path for one selected item. size=disk space; logical_size=data size; modified=last change; files/folders/items=recursive counts; direct_* counts=direct only.',
-            'inspect_path':'Inspect an exact verified path: size, type, purpose clues, app ownership, and direct children.',
+            'inspect_path':'Inspect a verified item before advice: nested tree, file types, metadata, purpose clues and ownership evidence. Partial coverage never proves safety.',
             'search_files':'Find files/folders by short name, type, size or dates. Dates: use day ranges or ISO after_date/before_date (YYYY-MM-DD, UTC), not timestamp arithmetic. Never use the whole question as query.',
             'list_children':'List direct children of a folder. Use paths from the results for further inspection.',
             'drive_overview':'Get whole-drive counts and size totals.',
@@ -231,6 +231,7 @@ class ToolRegistry:
             if not self.evidence: return {"error":"No scan loaded."}
             entry=self.evidence.inspect(arguments['path'])
             if 'error' not in entry:
+                entry['tree_evidence']=self.evidence.tree_summary(entry['path'])
                 entry['purpose_evidence']=self.evidence.role_evidence(entry['path'])
                 entry['known_location']=describe(entry['path'])
                 parent=self.evidence.result.records[entry['frn']].parent_frn

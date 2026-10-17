@@ -79,6 +79,24 @@ operation from the meaning of the question. Advice requests continue through
 the explanation flow rather than stopping at a supporting measurement.
 Ambiguous subjects should receive a question, not an assumed path.
 
+Selected and explicitly named items receive a bounded tree inspection before
+the model answers. This includes nested file-type counts, example file and
+subfolder paths, retained attributes, unknown measurements and scan totals.
+It uses the retained MFT tree without opening descendant files. Reparse-point
+targets are not followed. A file also receives its surrounding folder context.
+Search-discovered items are inspected before the next answer (up to four per
+result, with incomplete coverage marked). This does not require another model
+call. The same evidence supports deletion, editing, updates, replacement,
+moving, renaming and other change questions; the model interprets the action.
+
+Tree work is bounded to 20,000 records or approximately 100 milliseconds per
+item and cached for repeated questions. Large trees, links and inconsistent
+records are explicitly marked partial. Summary samples are not a complete
+file listing, and inspection cannot establish live use, backups, application
+dependencies, effective permissions or deletion safety. The response instructions
+require purpose first, action-specific consequences and an appropriate next step
+or alternative. Model-written reasoning still needs quality evaluation.
+
 Ollama and `qwen3.5:4b` must be installed separately. All model communication
 uses `127.0.0.1:11434`. Drive data and the SQLite index remain local. No cloud
 API, API key, new runtime package, or model training is required.

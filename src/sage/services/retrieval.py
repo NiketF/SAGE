@@ -9,6 +9,8 @@ import re
 import json
 import time
 import mimetypes
+from collections import Counter, deque
+from datetime import datetime, timezone
 
 from ..models import FileRecord, ScanResult
 from .evidence import format_bytes
@@ -161,6 +163,90 @@ class ScanEvidence:
             return {"status": "text", "bytes_read": len(data), "text": text}
         except (OSError, UnicodeError, KeyError):
             return {"status": "unavailable", "reason": "Contents could not be inspected."}
+
+    def tree_summary(self, path: str, *, max_records=20000, seconds=0.1) -> dict:
+        """Summarise retained MFT evidence without opening files or following links."""
+        entry = self.inspect(path)
+        if 'error' in entry:
+            return entry
+        result = self.result
+        key = (entry['frn'], result.sizes_complete, result.sized_files)
+        cache = getattr(self, '_tree_cache', {})
+        default_limits = max_records == 20000 and seconds == 0.1
+        if default_limits and key in cache:
+            return cache[key]
+        root = result.records[entry['frn']]
+        pending = deque([root.frn])
+        seen = set()
+        extensions, flags = Counter(), Counter()
+        examples, folders = {}, []
+        files = directories = unknown_sizes = gaps = links = 0
+        truncated = False
+        deadline = time.monotonic() + seconds
+        # ponytail: bounded metadata work per item; large trees explicitly stay partial.
+        # A background aggregate can replace this walk if measured scans need it.
+        while pending and len(seen) < max_records and time.monotonic() < deadline:
+            frn = pending.popleft()
+            if frn in seen:
+                gaps += 1
+                continue
+            seen.add(frn)
+            record = result.records.get(frn)
+            if record is None:
+                gaps += 1
+                continue
+            for mask, label in ((1,'read_only_attribute'),(2,'hidden'),(4,'system'),
+                                (0x200,'sparse'),(0x400,'reparse_point'),(0x800,'compressed'),
+                                (0x1000,'offline'),(0x4000,'encrypted')):
+                if record.attributes & mask:
+                    flags[label] += 1
+            links += int(bool(record.attributes & 0x400))
+            if record.is_directory:
+                if frn != root.frn:
+                    directories += 1
+                    if len(folders) < 6:
+                        folders.append(frn)
+                if not record.attributes & 0x400:
+                    children = result.children.get(frn, ())
+                    room = max(0, max_records - len(seen) - len(pending))
+                    truncated |= len(children) > room
+                    pending.extend(children[:room])
+            else:
+                files += 1
+                extension = ntpath.splitext(record.name)[1].casefold() or '(no extension)'
+                extensions[extension] += 1
+                examples.setdefault(extension, frn)
+                unknown_sizes += int(not record.size_ready or bool(record.size_error))
+        partial = bool(pending or gaps or links or truncated)
+        types = []
+        for extension, count in extensions.most_common(6):
+            sample = result.records[examples[extension]]
+            types.append({'extension':extension,'files_observed':count,
+                          'example_path':result.path_for(sample.frn),
+                          'example_space':format_bytes(sample.allocated_size) if sample.size_ready and not sample.size_error else 'pending'})
+        summary = {'path':entry['path'], 'source':'Retained MFT scan metadata; file contents were not read by this inspection.',
+                   'partial':partial,'records_checked':len(seen),'files_observed':files,
+                   'subfolders_observed':directories,'file_types':types,
+                   'subfolder_examples':[result.path_for(frn) for frn in folders],
+                   'attributes_observed':dict(flags),'files_with_unknown_size':unknown_sizes,
+                   'unfollowed_links':links,'missing_or_repeated_records':gaps,
+                   'coverage':'Bounded tree inspection is incomplete.' if partial else 'All reachable retained records in this item were inspected.',
+                   'limits':'No active-use, backup, runtime dependency, access-permission or content verification.'}
+        if root.is_directory:
+            counts = result.stats.get(root.frn)
+            if counts is not None:
+                summary['scanned_totals'] = {'files':counts[1],'subfolders':counts[2]}
+        else:
+            try:
+                summary['modified_date'] = datetime.fromtimestamp(root.modified,timezone.utc).date().isoformat() if root.modified else 'unknown'
+            except (ValueError, OverflowError, OSError):
+                summary['modified_date'] = 'unknown'
+        if default_limits:
+            if len(cache) >= 32:
+                cache.clear()
+            cache[key] = summary
+            self._tree_cache = cache
+        return summary
 
     def role_evidence(self, path: str) -> dict:
         """Bounded evidence about this item, not a declaration that it is safe."""

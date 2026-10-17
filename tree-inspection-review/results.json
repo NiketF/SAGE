@@ -1,0 +1,67 @@
+[
+  {
+    "case": "changes",
+    "question": "Can I rename this?",
+    "selected": [
+      "E:\\Toolbox"
+    ],
+    "reply": "The folder E:\\Toolbox contains a Python executable and environment folders used for running software. Renaming this folder will change its path, which may break links from other programs or scripts that reference it.\n\nThis is a partial explanation. Ask me to continue for the remaining details. No file was changed.",
+    "timings": {
+      "model_calls": 1,
+      "tool_calls": 0,
+      "first_token_seconds": 2.516,
+      "first_display_seconds": 6.312,
+      "shortened": true,
+      "status": "model_answer",
+      "total_seconds": 14.234
+    },
+    "model_metrics": {
+      "load_duration": 5005400,
+      "prompt_eval_duration": 2450047000,
+      "eval_duration": 11718647000,
+      "prompt_eval_count": 2225,
+      "eval_count": 71,
+      "done_reason": "length"
+    },
+    "style_proxy": {
+      "sentences": 5,
+      "at_most_20_words": 5,
+      "ratio": 1.0,
+      "formal_STE_certification": false
+    },
+    "lookups": [],
+    "rejected_reply": null
+  },
+  {
+    "case": "changes",
+    "question": "Can I update the settings in this file?",
+    "selected": [
+      "E:\\Project\\config.json"
+    ],
+    "reply": "The file E:\\Project\\config.json is a JSON settings file containing theme preferences like \"dark\" mode, likely used by the application in E:\\Project to control its visual appearance. You can update the settings in this file because it contains editable text data. However, since the scan did not verify if other programs read this file at startup, changing it could potentially affect how the application behaves or cause compatibility issues if those references exist elsewhere. To be safe, review the changes you intend to make and ensure no other scripts depend on these specific settings before saving. No file was changed.",
+    "timings": {
+      "model_calls": 1,
+      "tool_calls": 0,
+      "first_token_seconds": 3.219,
+      "first_display_seconds": 9.797,
+      "status": "model_answer",
+      "total_seconds": 22.203
+    },
+    "model_metrics": {
+      "load_duration": 48421900,
+      "prompt_eval_duration": 2989921000,
+      "eval_duration": 18985183000,
+      "prompt_eval_count": 2322,
+      "eval_count": 119,
+      "done_reason": "stop"
+    },
+    "style_proxy": {
+      "sentences": 5,
+      "at_most_20_words": 2,
+      "ratio": 0.4,
+      "formal_STE_certification": false
+    },
+    "lookups": [],
+    "rejected_reply": null
+  }
+]
