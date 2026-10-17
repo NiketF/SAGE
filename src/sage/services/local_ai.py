@@ -6,6 +6,8 @@ import json
 import ntpath
 import re
 import time
+import socket
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -33,7 +35,7 @@ def settings_links(reply: str) -> list[dict[str, str]]:
 
 MODEL_NAME = "qwen3.5:4b"
 OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"
-OLLAMA_TIMEOUT_SECONDS = 180
+OLLAMA_TIMEOUT_SECONDS = 30
 MODEL_TARGET_SECONDS = 15
 
 SYSTEM_INSTRUCTIONS = (
@@ -104,14 +106,43 @@ CLEANUP_INTENT = re.compile(
 
 class OllamaClient:
     """Small standard-library client; never sends evidence to a cloud endpoint."""
+    loading = threading.Event()
 
     def __init__(self, model: str = MODEL_NAME, transport: Callable | None = None) -> None:
         self.model = model
         self.transport = transport
         self.last_metrics: dict = {}
+        self._active_socket = None
+        self._cancelled = threading.Event()
+
+    def cancel(self):
+        self._cancelled.set()
+        if self._active_socket is not None:
+            try:
+                self._active_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def _bind_socket(self,connection):
+        self._active_socket=connection
+        if self._cancelled.is_set(): self.cancel()
+
+    def ready(self):
+        if self.transport is not None:return True
+        try:
+            opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(OLLAMA_CHAT_URL.rsplit('/',1)[0]+'/ps',timeout=.25) as response:
+                data=json.loads(response.read(65536))
+            return any(model.get('name')==self.model for model in data.get('models',[]))
+        except (OSError,ValueError,TypeError,AttributeError):return False
 
     @staticmethod
-    def _request(payload: dict, on_token: Callable[[str], None] | None = None) -> dict:
+    def _request(payload: dict, on_token: Callable[[str], None] | None = None, *, timeout_seconds: float | None = None, on_connection=None) -> dict:
+        budget = min(OLLAMA_TIMEOUT_SECONDS, timeout_seconds) if timeout_seconds is not None else OLLAMA_TIMEOUT_SECONDS
+        if budget <= 0:
+            raise RuntimeError("The response time limit was reached.")
+        deadline = time.monotonic() + budget
+        expired = threading.Event()
         request = urllib.request.Request(
             OLLAMA_CHAT_URL,
             data=json.dumps(payload).encode("utf-8"),
@@ -120,25 +151,51 @@ class OllamaClient:
         )
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(request, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
+            with opener.open(request, timeout=budget) as response:
+                connection = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+                if on_connection: on_connection(connection)
+                def cancel():
+                    expired.set()
+                    if connection is not None:
+                        try:
+                            connection.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                timer = threading.Timer(max(0, deadline - time.monotonic()), cancel)
+                timer.daemon = True
+                timer.start()
                 pieces: list[str] = []
+                tool_calls = []
                 for line in response:
+                    if expired.is_set() or time.monotonic() >= deadline:
+                        raise TimeoutError()
                     if not line.strip():
                         continue
                     chunk = json.loads(line)
+                    if not isinstance(chunk,dict):
+                        raise RuntimeError('Local model returned an invalid stream message.')
                     if chunk.get("error"):
                         raise RuntimeError(f"Local Ollama: {chunk['error']}")
                     message = chunk.get("message") or {}
-                    if message.get("tool_calls"):
+                    if not isinstance(message,dict):
+                        raise RuntimeError('Local model returned an invalid assistant message.')
+                    if message.get("tool_calls") and not payload.get("tools"):
                         raise RuntimeError("Local model requested an unavailable tool.")
+                    tool_calls.extend(message.get("tool_calls") or [])
                     content = message.get("content") or ""
+                    if not isinstance(content,str):
+                        raise RuntimeError('Local model returned invalid text.')
                     if content:
                         pieces.append(content)
                         if on_token:
                             on_token(content)
                     if chunk.get("done"):
                         chunk["message"] = {"role": "assistant", "content": "".join(pieces)}
+                        if tool_calls:
+                            chunk["message"]["tool_calls"] = tool_calls
                         return chunk
+                if expired.is_set() or time.monotonic() >= deadline:
+                    raise TimeoutError()
                 raise RuntimeError("Local Ollama ended its response before completion.")
         except TimeoutError as exc:
             raise RuntimeError(
@@ -147,25 +204,55 @@ class OllamaClient:
                 "This does not mean Ollama is disconnected."
             ) from exc
         except (OSError, ValueError, urllib.error.URLError) as exc:
+            if expired.is_set() or time.monotonic() >= deadline:
+                raise RuntimeError("The local AI response time limit was reached.") from exc
             raise RuntimeError(f"Local Ollama is unavailable: {exc}") from exc
+        finally:
+            if 'timer' in locals():
+                timer.cancel()
 
-    def chat(self, messages: list[dict], on_token: Callable[[str], None] | None = None, *, think: bool = False) -> dict:
+    def chat(self, messages: list[dict], on_token: Callable[[str], None] | None = None, *, think: bool = False, tools: list | None = None, timeout_seconds: float | None = None, max_tokens: int = 320, response_format=None) -> dict:
+        if self._cancelled.is_set(): raise RuntimeError('The scan conversation was cancelled.')
         payload = {
             "model": self.model,
             "messages": messages,
             "stream": True,
             "think": think,
-            "keep_alive": "10m",
-            "options": {"num_ctx": 4096, "temperature": 0.2, "num_predict": 640 if think else 320},
+            "keep_alive": "30m",
+            "options": {"num_ctx": 4096, "temperature": 0, "num_predict": min(max_tokens, 640)},
         }
-        response = self.transport(payload) if self.transport else self._request(payload, on_token)
-        self.last_metrics = {key: response[key] for key in ("load_duration", "prompt_eval_duration", "eval_duration", "prompt_eval_count", "eval_count") if key in response}
+        if tools:
+            payload["tools"] = tools
+        if response_format is not None:payload['format']=response_format
+        try:
+            response = self.transport(payload) if self.transport else self._request(payload, on_token, timeout_seconds=timeout_seconds,on_connection=self._bind_socket)
+        finally:
+            self._active_socket=None
+        self.last_metrics = {key: response[key] for key in ("load_duration", "prompt_eval_duration", "eval_duration", "prompt_eval_count", "eval_count", "done_reason") if key in response}
         message = response.get("message")
         if not isinstance(message, dict):
             raise RuntimeError("Local Ollama returned no assistant message.")
         if self.transport and on_token and message.get("content"):
             on_token(message["content"])
         return message
+
+    def warm(self, messages=None, tools=None) -> None:
+        payload={"model":self.model,"stream":False,"keep_alive":"30m","options":{"num_ctx":4096,"num_predict":1}}
+        if messages:
+            payload.update(messages=messages,tools=tools or [],think=False)
+        request = urllib.request.Request(OLLAMA_CHAT_URL if messages else OLLAMA_CHAT_URL.rsplit('/', 1)[0] + '/generate',
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        self.loading.set()
+        try:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=60) as response:
+                data = json.loads(response.read(65536))
+            if not data.get("done") or data.get("error"):
+                raise RuntimeError("Local model could not finish loading.")
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Local model is not ready. Scan facts remain available.") from exc
+        finally:
+            self.loading.clear()
 
 
 class ConversationAssistant:
@@ -176,12 +263,7 @@ class ConversationAssistant:
         self.evidence = ScanEvidence(result) if result else None
         self.profiler = ItemProfiler(result) if result else None
         self.index = DriveIndex()
-        if result is not None:
-            try:
-                self.index.update_scan(result)
-            except OSError:
-                pass
-        self.tools = ToolRegistry(self.evidence, self.index)
+        self.tools = ToolRegistry(self.evidence, None)
         self.client = client or OllamaClient()
         self.history: list[dict[str, str]] = []
         self._confirmed_path: str | None = None
@@ -344,7 +426,7 @@ class ConversationAssistant:
         # Strip only recognized predicates/titles, never shorten until a path exists.
         # Quote a path with a predicate-like name to remove that grammar ambiguity.
         paths = []
-        for match in re.finditer(r'[A-Za-z]:\\[^\n"\x60*?<>|]*', text):
+        for match in re.finditer(r'[A-Za-z]:\\(?:(?![A-Za-z]:\\)[^\n"\x60*?<>|])*', text):
             value = match[0].strip()
             single_quoted = match.start() > 0 and text[match.start() - 1] == "'"
             if single_quoted and "'" in value:
@@ -353,8 +435,11 @@ class ConversationAssistant:
                 paths.append(value.rstrip(" .!,;"))
                 continue
             words = value.split(" ")
+            clause = r"(?:should|can|could|what|does|do|is|are|uses|holds|contains|takes|safe to|to free|to save|for cleanup|instead|somewhere else)\b"
             prefix = next((candidate for end in range(len(words) - 1, 0, -1)
-                           if self.evidence and "error" not in self.evidence.inspect(candidate := " ".join(words[:end]).rstrip(" .!,;"))), None)
+                           if (re.match(clause, " ".join(words[end:]), re.I)
+                               or (" ".join(words[end:]).strip() == "to" and re.match(r'[A-Za-z]:\\', text[match.end():])))
+                           and self.evidence and "error" not in self.evidence.inspect(candidate := " ".join(words[:end]).rstrip(" .!,;"))), None)
             if prefix:
                 if prefix not in paths:
                     paths.append(prefix)

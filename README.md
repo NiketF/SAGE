@@ -4,9 +4,9 @@ SAGE (Storage Analysis and Guidance Engine) is a Windows-only NTFS storage
 prototype. It reads `$MFT` sequentially from the volume (the same approach as
 WizTree): names, parents, and logical/allocated sizes come from one pass, so
 the tree is usable with sizes as soon as the MFT scan finishes. After that
-scan, the assistant lists specific, rule-matched items you can delete on that
-drive, each with a confirmation button in the chat. The right pane also uses a
-local model (`qwen3.5:4b`) for other scan-grounded questions. No API key or
+scan of C:, the assistant retains its specific rule-matched cleanup list,
+with manual confirmation buttons in the chat. The right pane also uses a
+local model (`qwen3.5:4b`) for conversational, scan-grounded questions. No API key or
 cloud service is required.
 
 The prominent bar beneath the scan controls shows estimated `$MFT` read
@@ -33,7 +33,7 @@ delete on that drive, with exact paths and sizes, largest first. Only items
 over 20 MB that match known rules are listed: Windows Update and Delivery
 Optimization caches, Windows and user temp folders, crash dumps and error
 reports, browser and Electron app caches (Chrome, Edge, Brave, Firefox,
-Discord, Teams, VS Code, …), GPU shader caches, pip/npm/Yarn/NuGet/Gradle/Go
+Discord, Teams, VS Code, â€¦), GPU shader caches, pip/npm/Yarn/NuGet/Gradle/Go
 caches, project `node_modules` folders (only beside a `package.json`, never
 inside installed apps, `AppData`, or `resources` folders), installers (`.exe`, `.msi`, `.msix`, `.iso`) in
 Downloads, the Recycle Bin, and `Windows.old` upgrade leftovers. Documents,
@@ -47,117 +47,102 @@ Recycle Bin item empties the bin through Windows. The drive is rescanned
 afterward. Delete buttons only ever come from these rules; a model reply can
 add a button only for a path that is already in the verified list.
 
-Questions such as "which files are safe to delete" or "free up space" are
-answered from these rules immediately, without the model. Other questions go to
-the model together with the verified list, and it is instructed to cite full
-paths and sizes instead of generic advice. Asking about a verified item, even
-one under `C:\Windows`, shows its delete button under the reply.
+The existing C: cleanup list and its manual confirmation buttons are retained.
+The conversational assistant can inspect these candidates and explain their
+conditions, but it never creates delete buttons or performs file operations.
+Questions are interpreted by the model using the selection, recent conversation,
+and validated evidence tools, rather than a phrase-specific reply dispatcher.
 
-When a drive or a named folder has no rule-matched item, SAGE answers locally
-with the largest files and recognized caches there as review candidates (no
-delete buttons), or with the folder's largest items and the right removal route
-(for example, uninstalling apps through Installed apps), and says plainly that
-finding no candidate does not mean nothing can be removed.
+The conversation can review files, folders, and subfolders beyond rule-matched
+caches. Finding no rule candidate does not mean nothing can be reviewed or
+removed. Personal files need review; application and project dependencies need
+evidence. Advice does not create a delete button.
 
 SAGE marks Windows and application locations as protected for cleanup advice,
 except the specific caches in the verified cleanup list. Unknown paths are
 review candidates, not confirmed safe deletions. Every deletion requires the
 user to press a button and confirm.
 
-## Local AI
+## Local conversational AI
 
-Install Ollama separately and download the model with `ollama pull qwen3.5:4b`.
-SAGE connects only to `127.0.0.1:11434`; it does not send scan data to a cloud
-API. Questions run in a background worker so the tree remains responsive.
-The Ollama application/server must be running; SAGE does not start it.
-You do not need a separate `ollama run` chat session. SAGE uses a target
-response budget of about 15 seconds. If model generation is too slow, SAGE
-falls back to a deterministic local answer. The request timeout remains higher
-to tolerate cold model loading, and SAGE asks Ollama to keep the model loaded
-for 10 minutes between questions.
+The UI uses `services/conversation.py` (`DriveAssistant`). Qwen interprets the
+question with recent conversation, selected items, and previous results. It can
+choose validated read-only tools to inspect a path, search names or metadata,
+list children, search approved text, find references, and identify possible
+duplicates. There is no phrase-specific dispatcher in this UI conversation path.
+The older `local_ai.ConversationAssistant` remains for legacy callers and tests.
 
-Greetings, count/total-size questions, and drive-wide cleanup questions answer
-immediately from local logic. A cleanup question that names a folder or path
-(for example "what can I delete in Program Files (x86)?") is scoped to that
-folder instead of repeating the drive-wide list.
+Qwen writes the description and assessment in its own words; SAGE places the
+description first without supplying canned role sentences. SAGE supplies exact sizes,
+counts, and modification dates through `report_fact`; the model chooses that
+operation from the meaning of the question. Advice requests continue through
+the explanation flow rather than stopping at a supporting measurement.
+Ambiguous subjects should receive a question, not an assumed path.
 
-Every model request includes a compact summary of the whole scanned drive:
-used space, top-level folders by size, the largest files, and the biggest
-leaf folders. Named folders also get their largest direct children and any
-verified cleanup items inside them, so answers can cite exact subfolders and
-sizes.
+Ollama and `qwen3.5:4b` must be installed separately. All model communication
+uses `127.0.0.1:11434`. Drive data and the SQLite index remain local. No cloud
+API, API key, new runtime package, or model training is required.
 
-Select text anywhere in the assistant pane to ask about it, like quoting in a
-chat app. An "Asking about" bar appears above the input; the selected text is
-sent with the next question (or cleared with **Clear**), and any paths in it are
-resolved against the scan.
+### Scan and indexing
 
-Other questions first resolve mentioned folder/file names in the current scan,
-then send only relevant evidence and recent conversation to one model request. A folder-name index and cached largest-item rankings avoid repeated
-work. Duplicate names are supplied as multiple paths for clarification.
-Retrieval uses the existing in-memory scan, not another MFT pass or file reads.
-The model receives no file-operation tools or file contents.
+The tree is displayed without waiting for SQLite or content indexing. Indexing
+runs in a cancellable background worker with progress. It replaces removed scan
+paths, reuses unchanged excerpts, and closes database connections explicitly.
+Searches can use bounded current-scan metadata while indexing is still running.
 
-### In-depth item analysis
+Approved text excerpts have a 128 KiB file limit and at most eight 500-character
+chunks per file. Background text work has a two-second budget per scan update;
+this is partial coverage, not an exhaustive content audit. Sensitive locations,
+unapproved formats, binary files, offline items, and linked paths are excluded.
+The indexing API supports include/exclude paths. It never executes a file.
+If indexed text has no match, a targeted search can check up to 64 approved small
+files within a further one-second budget. This also has partial coverage.
+Item evidence includes nearby parent and sibling names from the scan to help
+explain context; nearby names do not confirm application ownership.
+PDF and Office content adapters and embeddings are not included.
 
-When a question is about one file or folder ("should I delete this?"), SAGE
-builds a profile of that item and gives it to the model, so the answer cites
-facts instead of generic advice:
+Content hits describe indexed text, not proof that a program currently uses a
+file. A missing hit does not prove a file is unreferenced. Duplicate candidates
+share a measured size; their contents are not compared. These limits remain in
+the tool evidence and response safeguards.
 
-- From the scan: size, last-modified date, attributes (hidden, system, link,
-  cloud/online-only), file and folder counts, which file types fill it, and how
-  much of it has not changed for 30 days or a year.
-- From Windows, read on demand for that item only: the installed app that owns
-  it (publisher, version, install date from the uninstall registry), the
-  version information of its main program, its creation date, and where a
-  downloaded file came from (its `Zone.Identifier`).
-- From a built-in knowledge list of about 60 well-known locations (Steam
-  libraries and caches, browser profiles, WinSxS, Windows.old, `node_modules`,
-  WSL and Docker disks, and so on): what the location is and the supported way
-  to remove or shrink it.
+### Responsiveness and safety
 
-When several items share a name, for example "should I delete steam?", SAGE
-lists each match with its size and role (for example "1.5 GB, part of Steam"
-or "30.0 MB, Steam's built-in web browser cache") and asks which one you mean.
-Protected items get a local reply built from the same profile: who owns the
-item, what fills it, how stale it is, and the supported removal route.
+The model is prepared in the background and kept warm for 30 minutes. A cold
+or unavailable model returns useful scan facts rather than queuing a long
+answer. Fifteen seconds is a performance target, not a cancellation point.
+There is a 30-second request ceiling, short adaptive output limits, at most two
+tool rounds, and no extended reasoning mode. Local disk access can still vary
+in duration. The HTTP deadline disconnects slow streams, and rescan cancels the
+old conversation's active connection.
 
-SAGE now keeps a local SQLite conversational index for scan metadata and safe,
-size-limited text excerpts from approved text-like files. The index is local
-only and supports hybrid retrieval: path/name search, metadata lookup, optional
-content snippets, and citation paths used in grounded answers.
+Complete sentences stream into the panel after path checks. The final answer replaces
+the provisional stream. Replies cut by the output limit are labelled partial,
+with an option to continue the conversation. On a small model, a partial answer
+may omit some requested explanation; it is not a verified full assessment.
 
-Replies stream into the assistant pane as text arrives. Basic Markdown bold,
-italics, headings, bullets, and inline code render with Tk text styles. A spinner
-shows actual retrieval/generation stages and elapsed time. Scanning again
-invalidates old assistant events.
+The new conversation cannot perform delete, move, rename, or modification
+operations and creates no operation buttons. The separate C: policy remains
+extensible; the existing C: suggestion list and manual tree operations retain
+their established safeguards. Whole-C-drive cleanup advice uses existing rule
+candidates. The model does not receive file-changing tools.
 
-The model uses a 4,096-token context (to fit the drive summary) and a 320-token
-response cap. Conversation history is bounded. Larger explanations
-can require a follow-up; instant model answers are not guaranteed on CPU or a
-GPU that cannot hold the whole model.
+Language targets short, direct, STE-inspired sentences. This is not formal
+ASD-STE100 certification. Model-written explanations still require evaluation;
+path checks and read-only tools cannot prove every natural-language conclusion.
 
-Run the read-only smoke evaluation on a synthetic scan with:
+Run current response checks and local-model trials from the project directory:
 
 ```powershell
-$env:PYTHONPATH = "src"
-python scripts/evaluate_local_ai.py
+$env:PYTHONPATH = 'src;tests'
+python -B -m unittest test_drive_conversation -v
+python -B scripts/evaluate_drive_conversation.py --warm --output conversation-review
 ```
 
-Measure retrieval separately from the model with synthetic data:
-
-```powershell
-$env:PYTHONPATH = "src"
-python scripts/benchmark_local_ai.py --records 600000
-python scripts/benchmark_local_ai.py --records 600000 --live
-```
-
-The live benchmark reports model loading, first text, and completion times.
-It changes no files on the scanned drive.
-
-The model cannot know every application dependency. Model replies can contain
-errors, including incorrect size conversions. Check the measured sizes in the
-tree before acting on a cleanup suggestion.
+The trial uses synthetic scan records and synthetic approved text. It does not
+scan personal files. JSON preserves timings and tool results; RESPONSES.md
+shows actual replies and marks partial/fallback outcomes. The older
+`evaluate_local_ai.py` and `benchmark_local_ai.py` exercise the legacy service.
 
 ## Run from source
 
@@ -213,8 +198,10 @@ python -m unittest discover -s tests -v
   installed app, program version information, and download source.
 - `services/known_folders.py` is the knowledge list of well-known Windows
   locations and their supported cleanup routes.
-- `services/local_ai.py` handles fast replies, cleanup-intent answers, relevant
-  evidence, bounded history, and streaming from the local model.
+- `services/conversation.py` is the active model-led UI conversation, bounded
+  retrieval loop, memory, response checks, and streaming decoder.
+- `services/local_ai.py` contains the deadline/cancellation-aware Ollama client
+  and the earlier conversation service for compatibility.
 - `ui/assistant_panel.py` renders chat replies and embeds a delete button per
   verified cleanup item.
 - `ui/markdown.py` converts assistant formatting into native Tk text styles.
@@ -249,7 +236,7 @@ delete actions require confirmation.
 - Folder allocation totals sum contained files. NTFS directory metadata overhead
   is not included.
 - Active MFT records are analyzed. Deleted-record forensics, alternate data
-  streams, hard-link name expansion, and duplicate detection are still out of
+  streams, hard-link name expansion, and content-verified duplicate detection are still out of
   scope. Conversational indexing is local-only, read-only, and bounded by file
   type, size limits, and safety exclusions.
 - Live filesystems can change during a scan, so a small number of unreadable

@@ -18,7 +18,8 @@ from ..platform.windows.drives import get_disk_space, list_ntfs_volumes
 from ..platform.windows.file_operations import delete_permanently, empty_recycle_bin, shell_file_operation
 from ..services.cleanup import CleanupSuggestion, cleanup_report
 from ..services.evidence import EvidenceAssistant, format_bytes
-from ..services.local_ai import ConversationAssistant, OllamaClient
+from ..services.local_ai import OllamaClient
+from ..services.conversation import DriveAssistant as ConversationAssistant
 from ..services.scanner import analyze_sizes, scan_ntfs
 from .assistant_panel import AssistantPanel
 from .styles import ACCENT, SURFACE, TEXT, TEXT_SECONDARY, configure_styles
@@ -93,7 +94,7 @@ class SageApplication(tk.Tk):
 
         def worker() -> None:
             try:
-                OllamaClient().chat([])
+                OllamaClient().warm([{'role':'system','content':self._conversation.system_prompt()}])
                 status = "Ready for your question."
             except RuntimeError:
                 status = "Local AI unavailable — basic scan answers still work"
@@ -246,6 +247,7 @@ class SageApplication(tk.Tk):
         self._result = None
         self._pending_size_completion = None
         self._assistant = EvidenceAssistant()
+        self._conversation.cancel()
         self._conversation = ConversationAssistant()
         if self._assistant_busy:
             self.assistant_panel.finish_reply("The drive scan changed. Ask again once the new tree is ready.")
@@ -376,6 +378,12 @@ class SageApplication(tk.Tk):
                 elif kind == "ai_ready":
                     if not self._assistant_busy:
                         self.assistant_panel.set_status(event[2])
+                elif kind == "index_progress":
+                    if not self._assistant_busy:
+                        if event[2]>=event[3]:
+                            if not OllamaClient.loading.is_set():self.assistant_panel.set_status('Local search is ready for your question.')
+                        else:
+                            self.assistant_panel.set_status(f"Preparing local search: {event[2]:,}/{event[3]:,} items")
                 elif kind == "error":
                     self._job_failed(event[2], event[3])
                 elif kind == "operation_done":
@@ -431,6 +439,9 @@ class SageApplication(tk.Tk):
     def _size_finished(self, result: ScanResult) -> None:
         if result is not self._result:
             return
+        generation = self._generation
+        self._conversation.start_indexing(on_progress=lambda current,total:
+            self._events.put(("index_progress",generation,current,total)))
         self.tree_panel.refresh_loaded_rows()
         self.progress_bar.configure(mode="determinate", value=100)
         self.progress_phase.set("Drive scan complete")
@@ -846,6 +857,7 @@ class SageApplication(tk.Tk):
         self._scan_cancel.set()
         self._size_cancel.set()
         self._drive_refresh_closed = True
+        self._conversation.cancel()
         if self._drive_refresh_job is not None:
             self.after_cancel(self._drive_refresh_job)
         self.destroy()

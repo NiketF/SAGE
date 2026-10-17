@@ -1,0 +1,289 @@
+[
+  {
+    "case": "size",
+    "question": "What is its size?",
+    "selected": [
+      "E:\\Clips"
+    ],
+    "reply": "`E:\\Clips` uses 977 KB of disk space.",
+    "timings": {
+      "model_calls": 1,
+      "tool_calls": 1,
+      "first_token_seconds": 3.687,
+      "status": "verified_fact",
+      "total_seconds": 5.343,
+      "first_display_seconds": 5.343
+    },
+    "model_metrics": {
+      "load_duration": 3111600,
+      "prompt_eval_duration": 3630427000,
+      "eval_duration": 1650517000,
+      "prompt_eval_count": 1684,
+      "eval_count": 6,
+      "done_reason": "stop"
+    },
+    "style_proxy": {
+      "sentences": 1,
+      "at_most_20_words": 1,
+      "ratio": 1.0,
+      "formal_STE_certification": false
+    },
+    "lookups": [
+      {
+        "name": "report_fact",
+        "arguments": {
+          "field": "size",
+          "final": true
+        },
+        "result": {
+          "path": "E:\\Clips",
+          "field": "size",
+          "value": "977 KB",
+          "answer": "`E:\\Clips` uses 977 KB of disk space."
+        }
+      }
+    ],
+    "rejected_reply": null
+  },
+  {
+    "case": "size",
+    "question": "How much space does it occupy?",
+    "selected": [],
+    "reply": "`E:\\Clips` uses 977 KB of disk space.",
+    "timings": {
+      "model_calls": 1,
+      "tool_calls": 1,
+      "first_token_seconds": 3.062,
+      "status": "verified_fact",
+      "total_seconds": 4.875,
+      "first_display_seconds": 4.875
+    },
+    "model_metrics": {
+      "load_duration": 3204600,
+      "prompt_eval_duration": 3011499000,
+      "eval_duration": 1817940000,
+      "prompt_eval_count": 1721,
+      "eval_count": 6,
+      "done_reason": "stop"
+    },
+    "style_proxy": {
+      "sentences": 1,
+      "at_most_20_words": 1,
+      "ratio": 1.0,
+      "formal_STE_certification": false
+    },
+    "lookups": [
+      {
+        "name": "report_fact",
+        "arguments": {
+          "field": "size",
+          "final": true
+        },
+        "result": {
+          "path": "E:\\Clips",
+          "field": "size",
+          "value": "977 KB",
+          "answer": "`E:\\Clips` uses 977 KB of disk space."
+        }
+      }
+    ],
+    "rejected_reply": null
+  },
+  {
+    "case": "config",
+    "question": "What could happen if I remove this?",
+    "selected": [
+      "E:\\Project\\config.json"
+    ],
+    "reply": "This JSON file stores a dark theme setting for the Project app. Removing it may reset settings or stop startup if the app relies on it. Search the project for references first before deleting. No file was changed.",
+    "timings": {
+      "model_calls": 1,
+      "tool_calls": 0,
+      "first_token_seconds": 3.797,
+      "first_display_seconds": 9.203,
+      "status": "model_answer",
+      "total_seconds": 18.609
+    },
+    "model_metrics": {
+      "load_duration": 3645200,
+      "prompt_eval_duration": 3596886000,
+      "eval_duration": 14819966000,
+      "prompt_eval_count": 1734,
+      "eval_count": 49,
+      "done_reason": "stop"
+    },
+    "style_proxy": {
+      "sentences": 4,
+      "at_most_20_words": 4,
+      "ratio": 1.0,
+      "formal_STE_certification": false
+    },
+    "lookups": [],
+    "rejected_reply": null
+  },
+  {
+    "case": "media",
+    "question": "Should I remove this to free space?",
+    "selected": [
+      "E:\\Clips"
+    ],
+    "reply": "The Clips folder holds one video file and likely stores media recordings. Review the video before deleting, as it may be needed for playback or backups. No file was changed.",
+    "timings": {
+      "model_calls": 1,
+      "tool_calls": 0,
+      "first_token_seconds": 2.547,
+      "first_display_seconds": 8.453,
+      "status": "model_answer",
+      "total_seconds": 13.578
+    },
+    "model_metrics": {
+      "load_duration": 3712000,
+      "prompt_eval_duration": 2494414000,
+      "eval_duration": 11028544000,
+      "prompt_eval_count": 1687,
+      "eval_count": 37,
+      "done_reason": "stop"
+    },
+    "style_proxy": {
+      "sentences": 3,
+      "at_most_20_words": 3,
+      "ratio": 1.0,
+      "formal_STE_certification": false
+    },
+    "lookups": [],
+    "rejected_reply": null
+  },
+  {
+    "case": "media",
+    "question": "I need these videos for my editing work.",
+    "selected": [],
+    "reply": "The Clips folder holds one video file likely used for editing work. Keep the recording.mp4 file as it supports your editing needs. Removing it may cause playback issues or loss of project assets. No file was changed.",
+    "timings": {
+      "model_calls": 1,
+      "tool_calls": 0,
+      "first_token_seconds": 2.891,
+      "first_display_seconds": 8.563,
+      "status": "model_answer",
+      "total_seconds": 18.235
+    },
+    "model_metrics": {
+      "load_duration": 4368600,
+      "prompt_eval_duration": 2842943000,
+      "eval_duration": 15330880000,
+      "prompt_eval_count": 1735,
+      "eval_count": 50,
+      "done_reason": "stop"
+    },
+    "style_proxy": {
+      "sentences": 4,
+      "at_most_20_words": 4,
+      "ratio": 1.0,
+      "formal_STE_certification": false
+    },
+    "lookups": [],
+    "rejected_reply": null
+  },
+  {
+    "case": "references",
+    "question": "Which files mention config.json?",
+    "selected": [],
+    "reply": "main.py in E:\\Project reads config.json at startup. This code references config.json directly. Removing it may break the application's configuration loading.\n\nThis is a partial explanation. Ask me to continue for the remaining details. No file was changed.",
+    "timings": {
+      "model_calls": 2,
+      "tool_calls": 1,
+      "first_token_seconds": 3.25,
+      "first_display_seconds": 16.328,
+      "shortened": true,
+      "status": "model_answer",
+      "total_seconds": 23.703
+    },
+    "model_metrics": {
+      "load_duration": 3586800,
+      "prompt_eval_duration": 1246247000,
+      "eval_duration": 12729652000,
+      "prompt_eval_count": 1990,
+      "eval_count": 41,
+      "done_reason": "length"
+    },
+    "style_proxy": {
+      "sentences": 6,
+      "at_most_20_words": 6,
+      "ratio": 1.0,
+      "formal_STE_certification": false
+    },
+    "lookups": [
+      {
+        "name": "find_references",
+        "arguments": {
+          "query": "config.json",
+          "scope": "E:"
+        },
+        "result": {
+          "items": [
+            {
+              "path": "E:\\Project\\main.py",
+              "chunk_index": 0,
+              "snippet": "settings = read_json(\"config.json\")",
+              "source": "indexed_text"
+            }
+          ],
+          "scope": "E:",
+          "additional_files_checked": 0,
+          "coverage": "Only approved bounded text excerpts were searched. No match does not prove the file is unreferenced."
+        }
+      }
+    ],
+    "rejected_reply": null
+  },
+  {
+    "case": "duplicates",
+    "question": "Are there any possible duplicate files?",
+    "selected": [],
+    "reply": "Two files in E:\\Copies share the same size but unverified contents. They are likely duplicates by measurement, yet content verification failed. Review if they hold identical data before deciding on removal or keeping both copies.\n\nThis is a partial explanation. Ask me to continue for the remaining details. Their contents have not been compared, so these are possible duplicates only.",
+    "timings": {
+      "model_calls": 2,
+      "tool_calls": 1,
+      "first_token_seconds": 2.688,
+      "first_display_seconds": 14.969,
+      "shortened": true,
+      "status": "model_answer",
+      "total_seconds": 22.922
+    },
+    "model_metrics": {
+      "load_duration": 4587200,
+      "prompt_eval_duration": 1185993000,
+      "eval_duration": 14263922000,
+      "prompt_eval_count": 1961,
+      "eval_count": 50,
+      "done_reason": "length"
+    },
+    "style_proxy": {
+      "sentences": 6,
+      "at_most_20_words": 6,
+      "ratio": 1.0,
+      "formal_STE_certification": false
+    },
+    "lookups": [
+      {
+        "name": "find_duplicates",
+        "arguments": {
+          "scope": "E:"
+        },
+        "result": {
+          "groups": [
+            {
+              "count": 2,
+              "paths": [
+                "E:\\Copies\\a.zip",
+                "E:\\Copies\\b.zip"
+              ]
+            }
+          ],
+          "content_verified": false,
+          "basis": "Same measured logical size only. Contents may differ; no deletion recommendation."
+        }
+      }
+    ],
+    "rejected_reply": null
+  }
+]

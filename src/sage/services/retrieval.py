@@ -115,6 +115,9 @@ class ScanEvidence:
     def _read_excerpt(self, record: FileRecord, limit: int = 2048) -> dict:
         """Read only a small selected local file; never execute it or follow links."""
         path = self.result.path_for(record.frn)
+        from .local_database import DriveIndex
+        if not path or not DriveIndex._safe_for_content_index(path,ntpath.splitext(path)[1].casefold(),bool(record.attributes & (0x400|0x1000|0x400000))):
+            return {"status":"not_read","reason":"Content policy excludes this item."}
         if not path or not record.size_ready or record.size_error or record.logical_size > limit:
             return {"status": "not_read", "reason": "Only small measured files are eligible."}
         current = record.frn
@@ -124,7 +127,7 @@ class ScanEvidence:
                 return {"status": "not_read", "reason": "Unresolved ancestry."}
             seen.add(current)
             ancestor = self.result.records[current]
-            if ancestor.attributes & 0x400:
+            if ancestor.attributes & (0x400 | 0x1000 | 0x400000):
                 return {"status": "not_read", "reason": "Reparse point."}
             if current == self.result.root_frn:
                 break

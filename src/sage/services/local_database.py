@@ -6,16 +6,16 @@ import ntpath
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from ..models import ScanResult
-from .retrieval import assess_path
+from .retrieval import assess_path, ScanEvidence
 
 _APPROVED_TEXT_EXTENSIONS = {
     ".txt", ".md", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".xml", ".html", ".csv", ".log"
 }
-_SENSITIVE_SEGMENTS = {"appdata", "credentials", "secrets", "private", "token", "password"}
-_REPARSE_ATTRIBUTE = 0x400
+_SENSITIVE_SEGMENTS = {"appdata", "credentials", "secrets", "private", "token", "tokens", "password", "passwords", ".ssh", ".aws", ".azure"}
 
 
 class DriveIndex:
@@ -32,6 +32,8 @@ class DriveIndex:
         self.max_content_bytes = max_content_bytes
         self.max_chunks_per_file = max_chunks_per_file
         self._ready = False
+        self.include_paths=()
+        self.exclude_paths=()
 
     @staticmethod
     def default_path() -> str:
@@ -42,12 +44,18 @@ class DriveIndex:
         path.parent.mkdir(parents=True, exist_ok=True)
         return str(path)
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+    @contextmanager
+    def _connect(self):
+        conn = sqlite3.connect(self.db_path, timeout=0.5)
         conn.row_factory = sqlite3.Row
+        conn.create_function('casefold',1,lambda value:str(value or '').casefold(),deterministic=True)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def ensure_schema(self) -> None:
         if self._ready:
@@ -82,6 +90,11 @@ class DriveIndex:
                 CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(path, snippet);
                 """
             )
+            if conn.execute('PRAGMA user_version').fetchone()[0] < 2:
+                # Reuse chunk row IDs so replacing one file does not scan the FTS table.
+                conn.execute('DELETE FROM content_fts')
+                conn.execute('INSERT INTO content_fts(rowid,path,snippet) SELECT rowid,path,snippet FROM content_chunks')
+                conn.execute('PRAGMA user_version=2')
         self._ready = True
 
     @staticmethod
@@ -89,11 +102,13 @@ class DriveIndex:
         if is_reparse or extension not in _APPROVED_TEXT_EXTENSIONS:
             return False
         parts = {part.casefold() for part in ntpath.normpath(path).split("\\") if part}
+        parts.add(ntpath.splitext(ntpath.basename(path))[0].casefold())
         return not bool(parts & _SENSITIVE_SEGMENTS)
 
     def _replace_content(self, conn: sqlite3.Connection, path: str, text: str) -> None:
+        for row in conn.execute('SELECT rowid FROM content_chunks WHERE path=?', (path,)).fetchall():
+            conn.execute('DELETE FROM content_fts WHERE rowid=?', (row[0],))
         conn.execute("DELETE FROM content_chunks WHERE path = ?", (path,))
-        conn.execute("DELETE FROM content_fts WHERE path = ?", (path,))
         chunk_size = 500
         for index, start in enumerate(range(0, len(text), chunk_size)):
             if index >= self.max_chunks_per_file:
@@ -101,37 +116,33 @@ class DriveIndex:
             snippet = text[start : start + chunk_size].strip()
             if not snippet:
                 continue
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT OR REPLACE INTO content_chunks(path, chunk_index, snippet) VALUES(?, ?, ?)",
                 (path, index, snippet),
             )
-            conn.execute("INSERT INTO content_fts(path, snippet) VALUES(?, ?)", (path, snippet))
+            conn.execute("INSERT INTO content_fts(rowid, path, snippet) VALUES(?, ?, ?)", (cursor.lastrowid, path, snippet))
 
-    def _read_text_excerpt(self, path: str) -> str | None:
-        try:
-            size = os.path.getsize(path)
-            if size <= 0 or size > self.max_content_bytes:
-                return None
-            with open(path, "rb") as stream:
-                raw = stream.read(self.max_content_bytes + 1)
-            if len(raw) > self.max_content_bytes or b"\x00" in raw:
-                return None
-            return raw.decode("utf-8", errors="ignore")
-        except OSError:
-            return None
-
-    def update_scan(self, result: ScanResult) -> None:
+    def update_scan(self, result: ScanResult, *, index_content: bool = True, cancelled=None, progress=None,
+                    include_paths: tuple = (), exclude_paths: tuple = (), content_seconds: float = 2) -> None:
         """Incrementally upsert metadata and index safe local text excerpts."""
         self.ensure_schema()
-        now = int(time.time())
+        self.include_paths=include_paths
+        self.exclude_paths=exclude_paths
+        now = time.time_ns()
+        evidence = ScanEvidence(result)
         with self._connect() as conn:
-            for record in result.records.values():
+            for count, record in enumerate(result.records.values()):
+                if cancelled and cancelled():
+                    raise InterruptedError('Index update cancelled.')
                 path = result.path_for(record.frn)
                 if not path:
                     continue
                 parent = ntpath.dirname(path.rstrip("\\")) if path.rstrip("\\") != result.volume.drive.rstrip("\\") else None
                 extension = ntpath.splitext(record.name)[1].casefold()
-                is_reparse = bool(record.attributes & _REPARSE_ATTRIBUTE)
+                previous = conn.execute('SELECT logical_bytes,modified_time FROM files WHERE path=?', (path,)).fetchone()
+                if previous and (not record.modified or previous['logical_bytes'] != record.logical_size or previous['modified_time'] != record.modified):
+                    self._replace_content(conn, path, '')
+                    conn.execute('UPDATE files SET content_indexed=0 WHERE path=?', (path,))
                 conn.execute(
                     """
                     INSERT INTO files(path, parent_path, name, extension, is_directory, logical_bytes, allocated_bytes, modified_time, scan_drive, indexed_at, content_indexed)
@@ -153,23 +164,45 @@ class DriveIndex:
                         record.name,
                         extension,
                         1 if record.is_directory else 0,
-                        int(record.logical_size or 0),
-                        int(record.allocated_size or 0),
+                        result.directory_sizes.get(record.frn, (None,None))[0] if record.is_directory else (record.logical_size if record.size_ready else None),
+                        result.directory_sizes.get(record.frn, (None,None))[1] if record.is_directory else (record.allocated_size if record.size_ready else None),
                         int(record.modified or 0),
                         result.volume.drive.upper(),
                         now,
                         path,
                     ),
                 )
-                if record.is_directory:
+                if progress and count % 1000 == 0:
+                    progress(count, len(result.records))
+            stale = conn.execute('SELECT path FROM files WHERE scan_drive=? AND indexed_at<>?', (result.volume.drive.upper(),now)).fetchall()
+            for row in stale:
+                if cancelled and cancelled():raise InterruptedError('Index update cancelled.')
+                self._replace_content(conn,row['path'],'')
+            conn.execute('DELETE FROM files WHERE scan_drive=? AND indexed_at<>?', (result.volume.drive.upper(),now))
+        if not index_content:
+            return
+        deadline = time.monotonic() + content_seconds
+        # ponytail: bounded local text excerpts, not a whole-drive content audit.
+        # Further content work is requested explicitly through search_content.
+        with self._connect() as conn:
+            for record in result.records.values():
+                if time.monotonic() >= deadline or cancelled and cancelled():
+                    break
+                path = result.path_for(record.frn)
+                extension = ntpath.splitext(record.name)[1].casefold()
+                if record.is_directory or not path or not self._safe_for_content_index(path,extension,bool(record.attributes & (0x400|0x1000|0x400000))):
                     continue
-                if not self._safe_for_content_index(path, extension, is_reparse):
+                if include_paths and not any(evidence.within(path,p) for p in include_paths):
                     continue
-                text = self._read_text_excerpt(path)
-                if not text:
+                if any(evidence.within(path,p) for p in exclude_paths):
                     continue
-                self._replace_content(conn, path, text)
-                conn.execute("UPDATE files SET content_indexed=1 WHERE path = ?", (path,))
+                row = conn.execute('SELECT content_indexed FROM files WHERE path=?',(path,)).fetchone()
+                if row and row[0]:
+                    continue
+                excerpt = evidence._read_excerpt(record,limit=self.max_content_bytes)
+                if excerpt.get('status') == 'text':
+                    self._replace_content(conn,path,excerpt['text'])
+                    conn.execute('UPDATE files SET content_indexed=1 WHERE path=?',(path,))
 
     def search_names(self, query: str, *, scope: str | None = None, limit: int = 10) -> list[dict]:
         self.ensure_schema()
@@ -179,8 +212,8 @@ class DriveIndex:
         where = "(name LIKE ? OR path LIKE ?)"
         params: list[object] = [f"%{term}%", f"%{term}%"]
         if scope:
-            where += " AND path LIKE ?"
-            params.append(ntpath.normpath(scope).rstrip("\\") + "%")
+            where += " AND instr(casefold(path), ?) = 1"
+            params.append(ntpath.normpath(scope).rstrip("\\").casefold() + "\\")
         params.append(max(1, min(limit, 50)))
         with self._connect() as conn:
             rows = conn.execute(
@@ -195,6 +228,17 @@ class DriveIndex:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def content_candidates(self,scope: str,limit: int=64) -> list[str]:
+        self.ensure_schema()
+        extensions=sorted(_APPROVED_TEXT_EXTENSIONS)
+        prefix=ntpath.normpath(scope).rstrip('\\').casefold()+'\\'
+        with self._connect() as conn:
+            rows=conn.execute('SELECT path FROM files WHERE is_directory=0 AND logical_bytes BETWEEN 1 AND ? '
+                'AND instr(casefold(path),?)=1 AND extension IN ('+','.join('?' for _ in extensions)+') '
+                'ORDER BY content_indexed,logical_bytes,path LIMIT ?',
+                [self.max_content_bytes,prefix,*extensions,limit]).fetchall()
+        return [row[0] for row in rows]
+
     def search_content(self, query: str, *, scope: str | None = None, limit: int = 10) -> list[dict]:
         self.ensure_schema()
         term = query.strip()
@@ -207,19 +251,19 @@ class DriveIndex:
                         """
                         SELECT c.path, c.chunk_index, c.snippet
                         FROM content_chunks c
-                        JOIN content_fts f ON f.path = c.path AND f.snippet = c.snippet
-                        WHERE f.snippet MATCH ? AND c.path LIKE ?
+                        JOIN content_fts f ON f.rowid = c.rowid
+                        WHERE f.snippet MATCH ? AND instr(casefold(c.path), ?) = 1
                         ORDER BY c.path, c.chunk_index
                         LIMIT ?
                         """,
-                        (term, ntpath.normpath(scope).rstrip("\\") + "%", max(1, min(limit, 50))),
+                        (term, ntpath.normpath(scope).rstrip("\\").casefold() + "\\", max(1, min(limit, 50))),
                     ).fetchall()
                 else:
                     rows = conn.execute(
                         """
                         SELECT c.path, c.chunk_index, c.snippet
                         FROM content_chunks c
-                        JOIN content_fts f ON f.path = c.path AND f.snippet = c.snippet
+                        JOIN content_fts f ON f.rowid = c.rowid
                         WHERE f.snippet MATCH ?
                         ORDER BY c.path, c.chunk_index
                         LIMIT ?
@@ -232,11 +276,11 @@ class DriveIndex:
                         """
                         SELECT path, chunk_index, snippet
                         FROM content_chunks
-                        WHERE snippet LIKE ? AND path LIKE ?
+                        WHERE snippet LIKE ? AND instr(casefold(path), ?) = 1
                         ORDER BY path, chunk_index
                         LIMIT ?
                         """,
-                        (f"%{term}%", ntpath.normpath(scope).rstrip("\\") + "%", max(1, min(limit, 50))),
+                        (f"%{term}%", ntpath.normpath(scope).rstrip("\\").casefold() + "\\", max(1, min(limit, 50))),
                     ).fetchall()
                 else:
                     rows = conn.execute(
@@ -305,8 +349,8 @@ class DriveIndex:
         where = "is_directory = 0"
         params: list[object] = []
         if scope:
-            where += " AND path LIKE ?"
-            params.append(ntpath.normpath(scope).rstrip("\\") + "%")
+            where += " AND instr(casefold(path), ?) = 1"
+            params.append(ntpath.normpath(scope).rstrip("\\").casefold() + "\\")
         params.append(max(1, min(limit, 50)))
         with self._connect() as conn:
             rows = conn.execute(
@@ -346,3 +390,44 @@ class DriveIndex:
             "guidance": risk.get("guidance", "Unknown impact."),
             "read_only": True,
         }
+
+    def search_metadata(self, *, scope: str, query: str = '', kind: str = 'any', extension: str = '',
+                        minimum_bytes: int = 0, modified_before: int = 0, modified_after: int = 0,
+                        sort: str = 'largest', limit: int = 8) -> list[dict]:
+        self.ensure_schema()
+        # instr avoids LIKE wildcard names and enforces folder boundaries.
+        prefix = ntpath.normpath(scope).rstrip('\\').casefold() + '\\'
+        where, args = ['instr(casefold(path),?)=1'], [prefix]
+        for clause, value in [('instr(casefold(name),?)>0',query.casefold()),
+                              ('extension=?',extension.casefold())]:
+            if value:
+                where.append(clause); args.append(value)
+        if kind in {'file','folder'}:
+            where.append('is_directory=?'); args.append(int(kind=='folder'))
+        if minimum_bytes:
+            where.append('allocated_bytes>=?'); args.append(minimum_bytes)
+        if modified_before:
+            where.append('modified_time>0 AND modified_time<?'); args.append(modified_before)
+        if modified_after:
+            where.append('modified_time>=?'); args.append(modified_after)
+        order = {'largest':'allocated_bytes DESC','recent':'modified_time DESC','oldest':'modified_time ASC','name':'name ASC'}[sort]
+        if sort in {'recent','oldest'}:
+            where.append('modified_time>0')
+        args.append(limit)
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                'SELECT path,name,is_directory,logical_bytes,allocated_bytes,modified_time FROM files WHERE '
+                + ' AND '.join(where) + ' ORDER BY ' + order + ',path LIMIT ?', args)]
+
+    def possible_duplicates(self, scope: str, limit: int = 5) -> dict:
+        self.ensure_schema()
+        prefix = ntpath.normpath(scope).rstrip('\\').casefold() + '\\'
+        groups=[]
+        with self._connect() as conn:
+            rows=conn.execute('SELECT logical_bytes,COUNT(*) AS n FROM files WHERE is_directory=0 AND logical_bytes>0 '
+                'AND instr(casefold(path),?)=1 GROUP BY logical_bytes HAVING COUNT(*)>1 ORDER BY logical_bytes DESC LIMIT ?', (prefix,limit)).fetchall()
+            for row in rows:
+                matches=conn.execute('SELECT path FROM files WHERE is_directory=0 AND logical_bytes=? AND instr(casefold(path),?)=1 LIMIT 8',
+                                     (row['logical_bytes'],prefix)).fetchall()
+                groups.append({'logical_bytes':row['logical_bytes'],'count':row['n'],'paths':[r[0] for r in matches]})
+        return {'groups':groups,'content_verified':False,'basis':'Same measured logical size only. Contents may differ; no deletion recommendation.'}
