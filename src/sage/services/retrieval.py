@@ -44,7 +44,7 @@ def assess_path(path: str, system_drive: str | None = None) -> dict[str, str]:
         action = "Use Windows Installed apps to uninstall an application you no longer use." if first.startswith("program files") else "Use Windows Storage cleanup or the relevant application settings."
         if len(parts) == 1 or first in {"system volume information", "recovery"}:
             return {"risk": "protected", "guidance": f"Do not directly delete or move this container. {action}"}
-        return {"risk": "unverified", "guidance": "This is an application location. Its contents and application ownership need assessment; location alone does not establish that every item is required or removable."}
+        return {"risk": "protected", "guidance": "This is an application location. Remove software with Installed apps or the owning application's cleanup flow, not by deleting this path directly."}
     if drive == system:
         if first in {"windows", "boot"}:
             if len(parts) == 1 or first == "boot" or parts in (["windows", "system32"], ["windows", "syswow64"], ["windows", "winsxs"]):
@@ -53,6 +53,8 @@ def assess_path(path: str, system_drive: str | None = None) -> dict[str, str]:
         if first in {"pagefile.sys", "swapfile.sys", "hiberfil.sys"}:
             return {"risk": "protected", "guidance": "Windows manages this file; do not delete it directly."}
         if first == "users" and "appdata" in parts:
+            if len(parts) >= 5 and parts[2:5] == ["appdata", "local", "programs"]:
+                return {"risk": "protected", "guidance": "This is an installed-application location under AppData. Use Installed apps or the app's own uninstaller instead of deleting this path directly."}
             if len(parts) >= 6 and parts[2:6] == ["appdata", "local", "pip", "cache"]:
                 return {"risk": "managed_cleanup", "guidance": "This matches pip's conventional cache location, not installed packages. Verify the exact cache with `python -m pip cache dir`; if it matches, use `python -m pip cache purge`. Purging discards cached downloads/wheels and may require downloading or rebuilding them later. Do not move the folder manually."}
             if len(parts) >= 5 and parts[2:5] == ["appdata", "local", "temp"]:

@@ -70,11 +70,11 @@ Install Ollama separately and download the model with `ollama pull qwen3.5:4b`.
 SAGE connects only to `127.0.0.1:11434`; it does not send scan data to a cloud
 API. Questions run in a background worker so the tree remains responsive.
 The Ollama application/server must be running; SAGE does not start it.
-You do not need a separate `ollama run` chat session. SAGE allows up to 180
-seconds per model request and requests that the model stay loaded for 10 minutes
-between questions. SAGE starts loading the model in a background worker when
-the app opens, so loading can overlap scanning. Cold loading and partial CPU
-execution can still take time.
+You do not need a separate `ollama run` chat session. SAGE uses a target
+response budget of about 15 seconds. If model generation is too slow, SAGE
+falls back to a deterministic local answer. The request timeout remains higher
+to tolerate cold model loading, and SAGE asks Ollama to keep the model loaded
+for 10 minutes between questions.
 
 Greetings, count/total-size questions, and drive-wide cleanup questions answer
 immediately from local logic. A cleanup question that names a folder or path
@@ -122,8 +122,10 @@ or "30.0 MB, Steam's built-in web browser cache") and asks which one you mean.
 Protected items get a local reply built from the same profile: who owns the
 item, what fills it, how stale it is, and the supported removal route.
 
-No database is used; profiles are built from the in-memory scan and cached
-until the next scan.
+SAGE now keeps a local SQLite conversational index for scan metadata and safe,
+size-limited text excerpts from approved text-like files. The index is local
+only and supports hybrid retrieval: path/name search, metadata lookup, optional
+content snippets, and citation paths used in grounded answers.
 
 Replies stream into the assistant pane as text arrives. Basic Markdown bold,
 italics, headings, bullets, and inline code render with Tk text styles. A spinner
@@ -200,6 +202,13 @@ python -m unittest discover -s tests -v
   safe-to-delete list from the finished scan.
 - `services/evidence.py` produces deterministic fallback answers.
 - `services/retrieval.py` retrieves bounded scan evidence and cleanup-risk labels.
+- `services/local_database.py` stores the persistent local SQLite metadata/content
+  index used by conversational retrieval.
+- `services/tool_registry.py` validates and executes approved read-only assistant
+  tools (`search_names`, `search_content`, `inspect_path`, `list_children`,
+  `summarize_folder`, `find_large_files`, `retrieve_context`, `impact_analysis`).
+- `services/action_policy.py` applies drive-aware read-only action policy
+  (including stricter `C:` policy tier).
 - `services/profile.py` builds the per-item profile: scan metadata, owning
   installed app, program version information, and download source.
 - `services/known_folders.py` is the knowledge list of well-known Windows
@@ -240,7 +249,8 @@ delete actions require confirmation.
 - Folder allocation totals sum contained files. NTFS directory metadata overhead
   is not included.
 - Active MFT records are analyzed. Deleted-record forensics, alternate data
-  streams, hard-link name expansion, SQLite persistence, duplicate detection,
-  deletion without user confirmation, and file-content indexing are out of scope.
+  streams, hard-link name expansion, and duplicate detection are still out of
+  scope. Conversational indexing is local-only, read-only, and bounded by file
+  type, size limits, and safety exclusions.
 - Live filesystems can change during a scan, so a small number of unreadable
   paths is expected and reported rather than treated as a fatal error.
