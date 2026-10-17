@@ -97,6 +97,25 @@ class MftParserTests(unittest.TestCase):
         self.assertEqual(parse_mft_file_record(junction)[7:], (1_700_000_000, 0x402))
         self.assertEqual(parse_mft_file_record(onedrive)[7:], (1_700_000_000, 0x2))
 
+    def test_parses_compressed_nonresident_data_sizes(self):
+        compressed_file = make_mft_record(
+            pack_file_name("archive.bin", 5),
+            pack_compressed_data(logical=100_000, uncompressed_alloc=102_400, compressed_alloc=40_960),
+        )
+        parsed = parse_mft_file_record(compressed_file)
+        self.assertIsNotNone(parsed)
+        # Should return logical size and actual compressed allocated size
+        self.assertEqual(parsed[5:7], (100_000, 40_960))
+
+    def test_falls_back_to_filename_size_when_data_attribute_absent(self):
+        # A record with $FILE_NAME sizes but no $DATA attribute in base record
+        record_without_data = make_mft_record(
+            pack_file_name("stream_only.dat", 5, logical=5000, allocated=8192)
+        )
+        parsed = parse_mft_file_record(record_without_data)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[5:7], (5000, 8192))
+
 
 def pack_resident_attr(attr_type: int, value: bytes) -> bytes:
     raw_len = 0x18 + len(value)
@@ -147,6 +166,19 @@ def pack_nonresident_data(logical: int, allocated: int) -> bytes:
     struct.pack_into("<q", buf, 0x28, allocated)
     struct.pack_into("<q", buf, 0x30, logical)
     struct.pack_into("<q", buf, 0x38, logical)
+    return bytes(buf)
+
+
+def pack_compressed_data(logical: int, uncompressed_alloc: int, compressed_alloc: int) -> bytes:
+    buf = bytearray(0x48)
+    struct.pack_into("<II", buf, 0, 0x80, 0x48)
+    buf[8] = 1
+    struct.pack_into("<H", buf, 0x0C, 0x0001)
+    struct.pack_into("<H", buf, 0x20, 0x48)
+    struct.pack_into("<q", buf, 0x28, uncompressed_alloc)
+    struct.pack_into("<q", buf, 0x30, logical)
+    struct.pack_into("<q", buf, 0x38, logical)
+    struct.pack_into("<q", buf, 0x40, compressed_alloc)
     return bytes(buf)
 
 

@@ -235,9 +235,10 @@ def collect_file_sizes(
         if progress and (result.sized_files % SIZE_PROGRESS_INTERVAL == 0 or result.sized_files == total):
             progress(result.sized_files, total, result.size_errors)
 
-    # One directory query returns size and allocation for many files. Match by
-    # NTFS file ID instead of relying on names, which may have hard links.
-    directories = [record for record in result.records.values() if record.is_directory]
+    # Query only directories that actually contain files needing size evidence,
+    # avoiding hundreds of thousands of redundant directory API calls.
+    needed_parents = {record.parent_frn for record in files if not record.size_ready}
+    directories = [record for record in result.records.values() if record.frn in needed_parents]
     directories.sort(key=lambda record: record.frn != result.root_frn)
     directory_iterator = iter(directories)
     directory_pending: dict[Future[list[tuple[int, int, int]]], int] = {}

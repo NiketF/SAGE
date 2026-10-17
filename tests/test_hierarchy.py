@@ -66,6 +66,31 @@ class HierarchyTests(unittest.TestCase):
         result.records[10].parent_frn = 10
         self.assertIsNone(result.path_for(11))
 
+    def test_breaks_directory_cycles_and_retains_descendants(self):
+        records = {
+            5: FileRecord(5, 5, ".", FILE_ATTRIBUTE_DIRECTORY),
+            10: FileRecord(10, 20, "DirA", FILE_ATTRIBUTE_DIRECTORY),
+            20: FileRecord(20, 10, "DirB", FILE_ATTRIBUTE_DIRECTORY),
+            11: FileRecord(11, 10, "nested.bin", 0, logical_size=100, allocated_size=128, size_ready=True),
+        }
+        result = build_scan_result(VolumeInfo("C:", "System", "NTFS"), records)
+        self.assertEqual(result.root_stats, (3, 1, 2))
+        self.assertEqual(result.directory_sizes[5], (100, 128))
+        self.assertTrue(result.sizes_complete)
+        self.assertIsNotNone(result.path_for(11))
+
+    def test_resolves_parent_when_sequence_number_differs_or_omitted(self):
+        sequenced_dir_frn = (3 << 48) | 10
+        records = {
+            5: FileRecord(5, 5, ".", FILE_ATTRIBUTE_DIRECTORY),
+            sequenced_dir_frn: FileRecord(sequenced_dir_frn, 5, "DirA", FILE_ATTRIBUTE_DIRECTORY),
+            11: FileRecord(11, 10, "child.bin", 0, logical_size=50, allocated_size=64, size_ready=True),
+        }
+        result = build_scan_result(VolumeInfo("C:", "System", "NTFS"), records)
+        self.assertEqual(result.records[11].parent_frn, sequenced_dir_frn)
+        self.assertEqual(result.path_for(11), "C:\\DirA\\child.bin")
+        self.assertEqual(result.directory_sizes[sequenced_dir_frn], (50, 64))
+
 
 if __name__ == "__main__":
     unittest.main()

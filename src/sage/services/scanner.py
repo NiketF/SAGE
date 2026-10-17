@@ -29,10 +29,11 @@ def scan_ntfs(
     if stage:
         stage("Building MFT hierarchy")
     result = build_scan_result(volume, records, skipped)
-    files = [record for record in result.records.values() if not record.is_directory]
-    if all(record.size_ready for record in files):
-        calculate_directory_sizes(result)
-        result.sized_files = len(files)
+    if not result.sizes_complete:
+        files = [record for record in result.records.values() if not record.is_directory]
+        if all(record.size_ready for record in files):
+            calculate_directory_sizes(result)
+            result.sized_files = len(files)
     return result
 
 
@@ -42,6 +43,10 @@ def analyze_sizes(
     cancelled: Callable[[], bool] | None = None,
 ) -> None:
     """Aggregate folder totals; walk directories only when MFT sizes are missing."""
+    if result.sizes_complete:
+        if progress:
+            progress(result.sized_files, result.sized_files, result.size_errors)
+        return
     files = [record for record in result.records.values() if not record.is_directory]
     if not files or all(record.size_ready for record in files):
         result.sized_files = len(files)

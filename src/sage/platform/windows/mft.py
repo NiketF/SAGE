@@ -72,15 +72,17 @@ def apply_mft_fixup(record: bytearray, offset: int = 0, record_size: int | None 
     usa_abs = offset + usa_offset
     if usa_count < 2 or usa_abs + usa_count * 2 > end:
         return False
-    usn = record[usa_abs : usa_abs + 2]
+    usn_b0 = record[usa_abs]
+    usn_b1 = record[usa_abs + 1]
     for i in range(1, usa_count):
         sector_end = offset + i * MFT_USA_STRIDE
         if sector_end > end or sector_end < offset + 2:
             return False
-        if record[sector_end - 2 : sector_end] != usn:
+        if record[sector_end - 2] != usn_b0 or record[sector_end - 1] != usn_b1:
             return False
         src = usa_abs + i * 2
-        record[sector_end - 2 : sector_end] = record[src : src + 2]
+        record[sector_end - 2] = record[src]
+        record[sector_end - 1] = record[src + 1]
     return True
 
 
@@ -121,22 +123,23 @@ def parse_data_runs(data: bytes) -> list[tuple[int, int]]:
 
 def parse_mft_file_record(
     record: bytes | bytearray | memoryview,
+    offset: int = 0,
 ) -> tuple[int, int, bool, str, int, int, int, int, int] | None:
     """Return (base_ref, sequence, is_directory, name, parent_frn, logical, allocated, modified, attributes).
 
     modified is Unix seconds from $STANDARD_INFORMATION; attributes are its Windows file attributes.
     """
-    if len(record) < 0x30 or record[0:4] != b"FILE":
+    rec_len = len(record) - offset
+    if rec_len < 0x30 or struct.unpack_from("<I", record, offset)[0] != 0x454C4946:
         return None
-    flags = struct.unpack_from("<H", record, 0x16)[0]
-    if not (flags & MFT_IN_USE):
+    flags_val = record[offset + 0x16] | (record[offset + 0x17] << 8)
+    if not (flags_val & MFT_IN_USE):
         return None
-    sequence = struct.unpack_from("<H", record, 0x10)[0]
-    first_attr = struct.unpack_from("<H", record, 0x14)[0]
-    used = struct.unpack_from("<I", record, 0x18)[0]
-    base_ref = struct.unpack_from("<Q", record, 0x20)[0]
+    sequence, _, first_attr, flags, used, _, base_ref = struct.unpack_from(
+        "<4HIIQ", record, offset + 0x10
+    )
     is_directory = bool(flags & MFT_IS_DIRECTORY)
-    limit = min(used, len(record))
+    limit = min(used, rec_len)
     name = ""
     parent_frn = 0
     name_rank = -1
@@ -144,49 +147,56 @@ def parse_mft_file_record(
     allocated = 0
     modified = 0
     attributes = 0
+    has_data = False
     reparse_tag = None
-    offset = first_attr
-    while offset + 16 <= limit:
-        attr_type = struct.unpack_from("<I", record, offset)[0]
+    cur_off = offset + first_attr
+    rec_end = offset + limit
+    while cur_off + 16 <= rec_end:
+        attr_type, attr_len = struct.unpack_from("<II", record, cur_off)
         if attr_type == ATTR_END:
             break
-        attr_len = struct.unpack_from("<I", record, offset + 4)[0]
-        if attr_len < 16 or offset + attr_len > limit:
+        if attr_len < 16 or cur_off + attr_len > rec_end:
             break
-        non_resident = record[offset + 8]
-        name_len = record[offset + 9]
+        non_resident = record[cur_off + 8]
+        name_len = record[cur_off + 9]
         if attr_type in (ATTR_STANDARD_INFORMATION, ATTR_REPARSE_POINT) and not non_resident:
-            value_len = struct.unpack_from("<I", record, offset + 0x10)[0]
-            value_start = offset + struct.unpack_from("<H", record, offset + 0x14)[0]
-            if attr_type == ATTR_STANDARD_INFORMATION and value_len >= 0x24 and value_start + 0x24 <= limit:
+            value_len, value_off = struct.unpack_from("<IH", record, cur_off + 0x10)
+            value_start = cur_off + value_off
+            if attr_type == ATTR_STANDARD_INFORMATION and value_len >= 0x24 and value_start + 0x24 <= rec_end:
                 filetime = struct.unpack_from("<Q", record, value_start + 8)[0]
                 modified = max(0, (filetime - FILETIME_UNIX_EPOCH) // 10_000_000)
                 attributes = struct.unpack_from("<I", record, value_start + 0x20)[0]
-            elif attr_type == ATTR_REPARSE_POINT and value_len >= 4 and value_start + 4 <= limit:
+            elif attr_type == ATTR_REPARSE_POINT and value_len >= 4 and value_start + 4 <= rec_end:
                 reparse_tag = struct.unpack_from("<I", record, value_start)[0]
         elif attr_type == ATTR_FILE_NAME and not non_resident:
-            parsed = _file_name_attr(record, offset)
+            parsed = _file_name_attr(record, cur_off)
             if parsed is not None:
-                candidate, parent, rank = parsed
+                candidate, parent, rank, fn_logical, fn_allocated = parsed
                 if rank > name_rank:
                     name, parent_frn, name_rank = candidate, parent, rank
+                    if not has_data:
+                        logical, allocated = fn_logical, fn_allocated
         elif attr_type == ATTR_DATA and name_len == 0:
-            sizes = _unnamed_data_sizes(record, offset, non_resident)
+            sizes = _unnamed_data_sizes(record, cur_off, non_resident)
             if sizes is not None:
                 logical, allocated = sizes
-        offset += attr_len
+                has_data = True
+        cur_off += attr_len
     if reparse_tag is not None and not reparse_tag & REPARSE_TAG_NAME_SURROGATE:
         attributes &= ~FILE_ATTRIBUTE_REPARSE_POINT
     return (base_ref, sequence, is_directory, name, parent_frn, logical, allocated, modified, attributes)
 
 
-def _file_name_attr(record: bytes | bytearray | memoryview, offset: int) -> tuple[str, int, int] | None:
-    value_len = struct.unpack_from("<I", record, offset + 0x10)[0]
-    value_off = struct.unpack_from("<H", record, offset + 0x14)[0]
+def _file_name_attr(
+    record: bytes | bytearray | memoryview, offset: int
+) -> tuple[str, int, int, int, int] | None:
+    value_len, value_off = struct.unpack_from("<IH", record, offset + 0x10)
     value_start = offset + value_off
     if value_off < 0x18 or value_len < 0x42 or value_start + value_len > len(record):
         return None
     parent = struct.unpack_from("<Q", record, value_start)[0]
+    fn_allocated = max(0, struct.unpack_from("<q", record, value_start + 0x28)[0])
+    fn_logical = max(0, struct.unpack_from("<q", record, value_start + 0x30)[0])
     chars = record[value_start + 0x40]
     namespace = record[value_start + 0x41]
     name_end = value_start + 0x42 + chars * 2
@@ -195,7 +205,7 @@ def _file_name_attr(record: bytes | bytearray | memoryview, offset: int) -> tupl
     name = bytes(record[value_start + 0x42 : name_end]).decode("utf-16-le", errors="replace")
     if not name:
         return None
-    return name, parent, _NAME_NS_RANK.get(namespace, 0)
+    return name, parent, _NAME_NS_RANK.get(namespace, 0), fn_logical, fn_allocated
 
 
 def _unnamed_data_sizes(
@@ -207,7 +217,11 @@ def _unnamed_data_sizes(
         lowest_vcn = struct.unpack_from("<q", record, offset + 0x10)[0]
         if lowest_vcn != 0:
             return None
-        allocated = max(0, struct.unpack_from("<q", record, offset + 0x28)[0])
+        flags = struct.unpack_from("<H", record, offset + 0x0C)[0]
+        if (flags & 0x0001) and offset + 0x48 <= len(record):
+            allocated = max(0, struct.unpack_from("<q", record, offset + 0x40)[0])
+        else:
+            allocated = max(0, struct.unpack_from("<q", record, offset + 0x28)[0])
         logical = max(0, struct.unpack_from("<q", record, offset + 0x30)[0])
         return logical, allocated
     value_len = struct.unpack_from("<I", record, offset + 0x10)[0]
@@ -307,20 +321,28 @@ def _volume_data(kernel32, handle: int) -> NTFS_VOLUME_DATA_BUFFER:
     return volume
 
 
-def _read_at(kernel32, handle: int, offset: int, size: int, sector: int) -> bytes:
+def _read_at(
+    kernel32, handle: int, offset: int, size: int, sector: int, out_buf: ctypes.Array | None = None
+) -> bytes | memoryview:
     if size <= 0:
         return b""
     aligned_off = offset - (offset % sector)
     aligned_end = ((offset + size + sector - 1) // sector) * sector
     aligned_size = aligned_end - aligned_off
-    buf = ctypes.create_string_buffer(aligned_size)
+    if out_buf is not None and len(out_buf) >= aligned_size:
+        buf = out_buf
+    else:
+        buf = ctypes.create_string_buffer(aligned_size)
     if not kernel32.SetFilePointerEx(handle, aligned_off, None, FILE_BEGIN):
         raise ctypes.WinError(ctypes.get_last_error())
     read = wintypes.DWORD()
     if not kernel32.ReadFile(handle, buf, aligned_size, ctypes.byref(read), None):
         raise ctypes.WinError(ctypes.get_last_error())
     start = offset - aligned_off
-    return buf.raw[start : start + min(size, max(0, read.value - start))]
+    take = min(size, max(0, read.value - start))
+    if out_buf is not None:
+        return memoryview(buf)[start : start + take]
+    return buf.raw[start : start + take]
 
 
 def _mft_data_runs(record: bytearray) -> list[tuple[int, int]]:
@@ -400,6 +422,7 @@ def enumerate_mft(
         if progress_details:
             progress_details(0, 0.0)
 
+        read_buf = ctypes.create_string_buffer(MFT_BUFFER_SIZE + 4096)
         pending = bytearray()
         # A few hundred distinct attribute values cover millions of records; share one int each.
         attribute_values: dict[int, int] = {}
@@ -411,14 +434,17 @@ def enumerate_mft(
             usable = len(pending) - (len(pending) % record_size)
             rec_off = 0
             while rec_off < usable:
-                if pending[rec_off : rec_off + 4] == b"FILE":
+                if struct.unpack_from("<I", pending, rec_off)[0] == 0x454C4946:
                     if apply_mft_fixup(pending, rec_off, record_size):
-                        parsed = parse_mft_file_record(
-                            memoryview(pending)[rec_off : rec_off + record_size]
-                        )
+                        parsed = parse_mft_file_record(pending, rec_off)
                         if parsed is not None:
                             base_ref, sequence, is_directory, name, parent_frn, logical, allocated, modified, file_attributes = parsed
-                            frn = (record_index & NTFS_RECORD_NUMBER_MASK) | (sequence << 48)
+                            rec_num = record_index & NTFS_RECORD_NUMBER_MASK
+                            # $BadClust record 8 unnamed $DATA maps the entire volume capacity.
+                            # Cap logical size to allocated size to prevent artificial whole-drive inflation.
+                            if rec_num == 8 and name == "$BadClust":
+                                logical = allocated
+                            frn = rec_num | (sequence << 48)
                             if base_ref:
                                 if logical or allocated:
                                     extension_sizes[base_ref & NTFS_RECORD_NUMBER_MASK] = (
@@ -472,7 +498,7 @@ def enumerate_mft(
                 if cancelled and cancelled():
                     raise InterruptedError("MFT scan cancelled.")
                 chunk = min(remaining, MFT_BUFFER_SIZE)
-                data = _read_at(kernel32, handle, disk_offset, chunk, sector)
+                data = _read_at(kernel32, handle, disk_offset, chunk, sector, read_buf)
                 if not data:
                     break
                 pending.extend(data)
@@ -484,10 +510,12 @@ def enumerate_mft(
     finally:
         kernel32.CloseHandle(handle)
 
-    for frn, record in records.items():
-        extra = extension_sizes.get(frn & NTFS_RECORD_NUMBER_MASK)
-        if extra and not record.is_directory and record.logical_size == 0 and record.allocated_size == 0:
-            record.logical_size, record.allocated_size = extra
+    if extension_sizes:
+        rec_by_num = {r.frn & NTFS_RECORD_NUMBER_MASK: r for r in records.values()}
+        for base_num, extra in extension_sizes.items():
+            record = rec_by_num.get(base_num)
+            if record and not record.is_directory and record.logical_size == 0 and record.allocated_size == 0:
+                record.logical_size, record.allocated_size = extra
 
     if progress:
         progress(len(records))
