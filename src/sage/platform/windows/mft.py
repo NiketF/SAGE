@@ -39,6 +39,8 @@ FILETIME_UNIX_EPOCH = 116444736000000000
 ATTR_END = 0xFFFFFFFF
 MFT_IN_USE = 0x0001
 MFT_IS_DIRECTORY = 0x0002
+ATTR_FLAG_COMPRESSED = 0x0001
+ATTR_FLAG_SPARSE = 0x8000
 _NAME_NS_RANK = {3: 3, 1: 2, 0: 1, 2: 0}
 
 
@@ -218,7 +220,7 @@ def _unnamed_data_sizes(
         if lowest_vcn != 0:
             return None
         flags = struct.unpack_from("<H", record, offset + 0x0C)[0]
-        if (flags & 0x0001) and offset + 0x48 <= len(record):
+        if (flags & (ATTR_FLAG_COMPRESSED | ATTR_FLAG_SPARSE)) and offset + 0x48 <= len(record):
             allocated = max(0, struct.unpack_from("<q", record, offset + 0x40)[0])
         else:
             allocated = max(0, struct.unpack_from("<q", record, offset + 0x28)[0])
@@ -442,12 +444,12 @@ def enumerate_mft(
                             rec_num = record_index & NTFS_RECORD_NUMBER_MASK
                             # $BadClust record 8 unnamed $DATA maps the entire volume capacity.
                             # Cap logical size to allocated size to prevent artificial whole-drive inflation.
-                            if rec_num == 8 and name == "$BadClust":
+                            if rec_num == 8 and (name == "$BadClust" or not name or name == "$BADCLUST"):
                                 logical = allocated
                             frn = rec_num | (sequence << 48)
                             if base_ref:
                                 if logical or allocated:
-                                    extension_sizes[base_ref & NTFS_RECORD_NUMBER_MASK] = (
+                                    extension_sizes[base_ref] = (
                                         logical,
                                         allocated,
                                     )
@@ -511,9 +513,13 @@ def enumerate_mft(
         kernel32.CloseHandle(handle)
 
     if extension_sizes:
-        rec_by_num = {r.frn & NTFS_RECORD_NUMBER_MASK: r for r in records.values()}
-        for base_num, extra in extension_sizes.items():
-            record = rec_by_num.get(base_num)
+        rec_by_num: dict[int, FileRecord] | None = None
+        for base_ref, extra in extension_sizes.items():
+            record = records.get(base_ref)
+            if record is None:
+                if rec_by_num is None:
+                    rec_by_num = {r.frn & NTFS_RECORD_NUMBER_MASK: r for r in records.values()}
+                record = rec_by_num.get(base_ref & NTFS_RECORD_NUMBER_MASK)
             if record and not record.is_directory and record.logical_size == 0 and record.allocated_size == 0:
                 record.logical_size, record.allocated_size = extra
 

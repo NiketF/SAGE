@@ -78,6 +78,19 @@ def pack_compressed_data(logical: int, uncompressed_alloc: int, compressed_alloc
     return bytes(buf)
 
 
+def pack_sparse_data(logical: int, uncompressed_alloc: int, sparse_alloc: int) -> bytes:
+    buf = bytearray(0x48)
+    struct.pack_into("<II", buf, 0, 0x80, 0x48)
+    buf[8] = 1
+    struct.pack_into("<H", buf, 0x0C, 0x8000)
+    struct.pack_into("<H", buf, 0x20, 0x48)
+    struct.pack_into("<q", buf, 0x28, uncompressed_alloc)
+    struct.pack_into("<q", buf, 0x30, logical)
+    struct.pack_into("<q", buf, 0x38, logical)
+    struct.pack_into("<q", buf, 0x40, sparse_alloc)
+    return bytes(buf)
+
+
 def make_mft_record(*attrs: bytes, flags: int = 1, sequence: int = 1, base: int = 0) -> bytearray:
     record = bytearray(1024)
     record[0:4] = b"FILE"
@@ -178,6 +191,20 @@ def check_compressed_file_allocation() -> None:
     print("[OK] Compressed file allocation passed.")
 
 
+def check_sparse_file_allocation() -> None:
+    fn = pack_file_name("sparse.bin", 5)
+    data = pack_sparse_data(logical=1000000, uncompressed_alloc=1048576, sparse_alloc=4096)
+    record = make_mft_record(fn, data)
+
+    rec = parse_mft_file_record(record, 0)
+    assert rec is not None
+    _, _, _, name, _, logical, allocated, _, _ = rec
+    assert name == "sparse.bin"
+    assert logical == 1000000
+    assert allocated == 4096  # Actual allocated size from offset 0x40, NOT uncompressed allocation
+    print("[OK] Sparse file allocation passed.")
+
+
 def check_file_name_fallback_size() -> None:
     # File without $DATA attribute; should fall back to $FILE_NAME sizes
     fn = pack_file_name("nodata.txt", 5, logical=4096, allocated=4096)
@@ -210,6 +237,7 @@ def main() -> None:
     check_cycle_breaking_and_aggregation()
     check_parent_sequence_mismatch()
     check_compressed_file_allocation()
+    check_sparse_file_allocation()
     check_file_name_fallback_size()
     check_badclust_capping_logic()
     print("All checks passed successfully.")

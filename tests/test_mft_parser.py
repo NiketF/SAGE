@@ -116,6 +116,16 @@ class MftParserTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed[5:7], (5000, 8192))
 
+    def test_parses_sparse_nonresident_data_sizes(self):
+        sparse_file = make_mft_record(
+            pack_file_name("sparse_disk.vhd", 5),
+            pack_sparse_data(logical=100_000_000, uncompressed_alloc=104_857_600, sparse_alloc=4096),
+        )
+        parsed = parse_mft_file_record(sparse_file)
+        self.assertIsNotNone(parsed)
+        # Should return logical size and actual sparse allocated size from offset 0x40
+        self.assertEqual(parsed[5:7], (100_000_000, 4096))
+
 
 def pack_resident_attr(attr_type: int, value: bytes) -> bytes:
     raw_len = 0x18 + len(value)
@@ -179,6 +189,19 @@ def pack_compressed_data(logical: int, uncompressed_alloc: int, compressed_alloc
     struct.pack_into("<q", buf, 0x30, logical)
     struct.pack_into("<q", buf, 0x38, logical)
     struct.pack_into("<q", buf, 0x40, compressed_alloc)
+    return bytes(buf)
+
+
+def pack_sparse_data(logical: int, uncompressed_alloc: int, sparse_alloc: int) -> bytes:
+    buf = bytearray(0x48)
+    struct.pack_into("<II", buf, 0, 0x80, 0x48)
+    buf[8] = 1
+    struct.pack_into("<H", buf, 0x0C, 0x8000)
+    struct.pack_into("<H", buf, 0x20, 0x48)
+    struct.pack_into("<q", buf, 0x28, uncompressed_alloc)
+    struct.pack_into("<q", buf, 0x30, logical)
+    struct.pack_into("<q", buf, 0x38, logical)
+    struct.pack_into("<q", buf, 0x40, sparse_alloc)
     return bytes(buf)
 
 

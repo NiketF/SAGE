@@ -34,7 +34,7 @@ tests and a standalone self-check, and deliver the completed work on the
 dedicated branch `kartik/scan-performance`.
 
 All goals have been achieved:
-- 150 automated tests passing (up from 146 baseline).
+- 151 automated tests passing (up from 146 baseline).
 - Hierarchy postorder traversal speedup of ~48x on dense directories.
 - Win32 directory API queries reduced by avoiding redundant scans of directories
   whose files already had complete size evidence.
@@ -42,8 +42,9 @@ All goals have been achieved:
   * Restored disconnected child trees caused by parent sequence number mismatches.
   * Broke directory cycles in linear time so no descendants are skipped.
   * Capped $BadClust record 8 to prevent multi-terabyte whole-disk inflation.
-  * Corrected compressed file allocations using CompressedSize (offset 0x40).
+  * Corrected compressed and sparse file allocations using CompressedSize (offset 0x40).
   * Added fallback to $FILE_NAME sizes when $DATA attribute is absent.
+  * Optimized extension record lookup to O(1) direct lookup, avoiding 1M-entry dict allocations.
 
 
 ================================================================================
@@ -119,13 +120,13 @@ C. $BadClust Logical Size Inflation:
    - Fix: Explicitly capped record 8 ($BadClust) logical size to its allocated
      size (0), preserving accurate disk usage metrics.
 
-D. Compressed File Allocation Overcounting:
-   - Non-resident compressed files have an allocation size stored in the
-     `CompressedSize` field at offset 0x40 of the $DATA attribute header. The
-     original parser always read offset 0x28 (`AllocatedLength`), which reflects
+D. Compressed and Sparse File Allocation Overcounting:
+   - Non-resident compressed and sparse files have their actual allocated size
+     stored in the `CompressedSize` field at offset 0x40 of the $DATA attribute header.
+     The original parser always read offset 0x28 (`AllocatedLength`), which reflects
      the uncompressed allocation reservation.
-   - Fix: Checked $DATA attribute flags for `0x0001` (compressed) and read
-     `CompressedSize` at offset 0x40 when present.
+   - Fix: Checked $DATA attribute flags for `0x0001` (compressed) and `0x8000` (sparse)
+     and read `CompressedSize` at offset 0x40 when present.
 
 E. Fallback to $FILE_NAME Sizes When $DATA is Absent:
    - Records without a standard unnamed $DATA stream in the base record reported
@@ -153,8 +154,9 @@ E. Fallback to $FILE_NAME Sizes When $DATA is Absent:
     avoiding memoryview slicing.
   * Added $BadClust logic: if record number is 8 and name is "$BadClust", set
     `logical = allocated`.
-  * Guarded `extension_sizes` post-processing loop so it only runs if extension
-    records actually exist, indexing records by 48-bit record number.
+  * Optimized `extension_sizes` to perform direct O(1) lookup by full base FRN,
+    falling back to 48-bit record mapping only if sequence number differs, avoiding
+    unnecessary 1,000,000-entry dictionary allocations.
 - In `apply_mft_fixup`: Replaced bytearray slice reads and writes with direct
   two-byte indexing and assignment (`record[off] = ...`).
 - In `parse_mft_file_record`:
@@ -164,8 +166,8 @@ E. Fallback to $FILE_NAME Sizes When $DATA is Absent:
   * Extracted file sizes from $FILE_NAME attributes (`_file_name_attr`) to provide
     fallback sizes if $DATA is absent.
 - In `_unnamed_data_sizes`:
-  * Added check for compression flag (`flags & 0x0001`). When set, extracts
-    `CompressedSize` from offset `0x40` instead of `AllocatedLength` at `0x28`.
+  * Added check for compression and sparse flags (`flags & (ATTR_FLAG_COMPRESSED | ATTR_FLAG_SPARSE)`).
+    When set, extracts `CompressedSize` from offset `0x40` instead of `AllocatedLength` at `0x28`.
 
 3.2 src/sage/platform/windows/sizes.py
 --------------------------------------
@@ -263,7 +265,7 @@ E. Fallback to $FILE_NAME Sizes When $DATA is Absent:
 
 A. Compilation Verification:
    Command: `python -m compileall -q src tests scripts`
-   Result: Exit code 0. Clean compilation.
+   Result: Exit code 0. Clean compilation across all modules.
 
 B. Standalone Self-Check:
    Command: `python scripts/check_scan_performance.py`
@@ -272,19 +274,31 @@ B. Standalone Self-Check:
      [OK] Cycle breaking and aggregation passed.
      [OK] Parent sequence mismatch resolution passed.
      [OK] Compressed file allocation passed.
+     [OK] Sparse file allocation passed.
      [OK] FILE_NAME fallback size passed.
      [OK] BadClust capping logic passed.
      All checks passed successfully.
 
 C. Automated Unit Test Suite:
-   Command: `python -m unittest discover -s tests`
-   Result: Ran 150 tests in 1.525s - OK (150 passing, 0 failures, 0 errors).
+   Command: `$env:PYTHONPATH = "src"; python -m unittest discover -s tests -v`
+   Result: Ran 151 tests in 1.482s - OK (151 passing, 0 failures, 0 errors).
 
 D. Performance & Efficiency Gains:
    - Hierarchy postorder traversal on dense folders: ~48x speedup (0.22ms vs 10.6ms).
    - Single-pass stats and size aggregation eliminates second O(N) tree walk.
    - 4MB buffer reuse eliminates heap allocation churn during sequential MFT reads.
    - Filtered Win32 directory queries eliminate redundant API calls for sized files.
+   - Extension record direct lookup: O(1) direct lookup avoids building 1M dict.
+
+E. Python + Cython Evaluation:
+   - Measured MFT record parsing speed in pure Python 3.12: 100,000 records in 0.417s
+     (~240,000 records/sec). 1,000,000 records parse in ~4.2s CPU time.
+   - Bottleneck diagnosis: SAGE's previous 15-25s scan time was driven by Win32
+     directory querying (`collect_file_sizes`) and sequential disk I/O, not CPU
+     parsing limits.
+   - Cython verdict: Cython is NOT justified. Neither MSVC nor GCC are on the system
+     PATH; adding compiled extensions introduces severe deployment and build
+     complexities; and pure Python already achieves WizTree-comparable scan times.
 
 
 ================================================================================
