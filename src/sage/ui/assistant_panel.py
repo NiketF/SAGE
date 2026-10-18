@@ -8,6 +8,7 @@ from collections.abc import Callable
 from tkinter import ttk
 
 from ..services.evidence import format_bytes
+from .floating_button import FloatingAskButton
 from .markdown import markdown_spans
 from .styles import (
     ACCENT, CONTROL_BORDER, FONT, FONT_CODE, FONT_SEMIBOLD,
@@ -37,6 +38,7 @@ class AssistantPanel(ttk.Frame):
         self._render_job: str | None = None
         self._spinner_job: str | None = None
         self._phase_job: str | None = None
+        self._check_sel_job: str | None = None
         self._started = 0.0
         self._phase = "Ready"
         self._phase_index = 0
@@ -72,10 +74,25 @@ class AssistantPanel(ttk.Frame):
             exportselection=False,
         )
         self.transcript.grid(row=2, column=0, sticky="nsew")
-        self.transcript.bind("<<Selection>>", self._capture_selection)
-        self.transcript.bind("<Button-3>", self._show_transcript_menu)
         self._quote = ""
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.transcript.yview)
+        self._pending_quote = ""
+        self._mouse_pressed = False
+        self._hover_button = FloatingAskButton(
+            self.transcript, command=self._on_ask_selection_clicked, text="Ask SAGE"
+        )
+        self.transcript.bind("<ButtonPress-1>", self._on_transcript_press)
+        self.transcript.bind("<ButtonRelease-1>", self._on_transcript_release)
+        self.transcript.bind("<<Selection>>", self._on_transcript_selection)
+        self.transcript.bind("<Button-3>", self._show_transcript_menu)
+        self.transcript.bind("<MouseWheel>", lambda _e: self._hover_button.hide())
+        self.transcript.bind("<Escape>", lambda _e: self._hover_button.hide())
+        self.transcript.bind("<Configure>", lambda _e: self._hover_button.hide())
+
+        def _on_transcript_scroll(*args):
+            self._hover_button.hide()
+            return self.transcript.yview(*args)
+
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=_on_transcript_scroll)
         scrollbar.grid(row=2, column=1, sticky="ns")
         self.transcript.configure(yscrollcommand=scrollbar.set)
         self.transcript.tag_configure("speaker", font=("Segoe UI Semibold", 9), spacing3=4)
@@ -109,10 +126,16 @@ class AssistantPanel(ttk.Frame):
             side="left", padx=(0, 8)
         )
 
+        self._selected_item: str | None = None
+        self.selected_bar = ttk.Frame(footer, style="Surface.TFrame")
+        self.selected_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        self.selected_bar.columnconfigure(0, weight=1)
         self.selected_text = tk.StringVar()
-        self.selected_label = ttk.Label(footer, textvariable=self.selected_text, style="SurfaceMuted.TLabel")
-        self.selected_label.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        self.selected_label.grid_remove()
+        self.selected_label = ttk.Label(self.selected_bar, textvariable=self.selected_text, style="SurfaceMuted.TLabel")
+        self.selected_label.grid(row=0, column=0, sticky="ew")
+        self.selected_clear_btn = ttk.Button(self.selected_bar, text="Clear", style="Quote.TButton", command=self.clear_selected_item)
+        self.selected_clear_btn.grid(row=0, column=1, padx=(8, 0))
+        self.selected_bar.grid_remove()
 
         # Quote bar
         self.quote_bar = ttk.Frame(footer, style="Quote.TFrame", padding=(10, 5, 6, 5))
@@ -188,6 +211,7 @@ class AssistantPanel(ttk.Frame):
     # ── Transcript helpers ────────────────────────────────────────────
 
     def write(self, speaker: str, message: str) -> None:
+        self._hover_button.hide()
         self.transcript.configure(state="normal")
         if self.transcript.index("end-1c") != "1.0":
             self.transcript.insert("end", "\n\n")
@@ -197,26 +221,88 @@ class AssistantPanel(ttk.Frame):
         self.transcript.see("end")
         self.transcript.configure(state="disabled")
 
+    def _on_transcript_press(self, _event: tk.Event) -> None:
+        self._mouse_pressed = True
+        self._hover_button.hide()
+
+    def _on_transcript_release(self, _event: tk.Event) -> None:
+        self._mouse_pressed = False
+        self._schedule_selection_check()
+
+    def _on_transcript_selection(self, _event: object = None) -> None:
+        if not self._mouse_pressed:
+            self._schedule_selection_check()
+
+    def _schedule_selection_check(self) -> None:
+        if self._check_sel_job:
+            self.after_cancel(self._check_sel_job)
+        self._check_sel_job = self.after(20, self._check_transcript_selection)
+
+    def _check_transcript_selection(self) -> None:
+        self._check_sel_job = None
+        ranges = self.transcript.tag_ranges("sel")
+        if not ranges:
+            self._pending_quote = ""
+            self._hover_button.hide()
+            return
+        text = self.transcript.get(ranges[0], ranges[1]).strip()
+        if not text:
+            self._pending_quote = ""
+            self._hover_button.hide()
+            return
+        self._pending_quote = text
+        bbox = self.transcript.bbox(ranges[0])
+        btn_w = self._hover_button.WIDTH
+        btn_h = self._hover_button.HEIGHT
+        t_w = self.transcript.winfo_width()
+        if bbox:
+            bx, by, bw, bh = bbox
+            x = max(8, min(bx, t_w - btn_w - 24 if t_w > btn_w else 8))
+            y = by - btn_h - 6
+            if y < 2:
+                y = by + bh + 6
+        else:
+            x, y = 8, 8
+        self._hover_button.show(x, y)
+
+    def _on_ask_selection_clicked(self) -> None:
+        self._hover_button.hide()
+        if self._pending_quote:
+            self._apply_quote(self._pending_quote)
+            self.question.focus_set()
+
+    def _apply_quote(self, text: str) -> None:
+        self._quote = text[:2000]
+        preview = " ".join(text.split())
+        suffix = "\u2026" if len(preview) > 200 else ""
+        self.quote_text.set(f"Asking about: \u201c{preview[:200]}{suffix}\u201d")
+        self.quote_bar.grid()
+
     def _capture_selection(self, _event: object = None) -> None:
         ranges = self.transcript.tag_ranges("sel")
         text = self.transcript.get(ranges[0], ranges[1]).strip() if ranges else ""
         if text:
-            self._quote = text[:2000]
-            preview = " ".join(text.split())
-            suffix = "\u2026" if len(preview) > 200 else ""
-            self.quote_text.set(f"Asking about: \u201c{preview[:200]}{suffix}\u201d")
-            self.quote_bar.grid()
+            self._apply_quote(text)
 
     def set_selected_item(self, path: str | None) -> None:
         """Show the folder a click will use when the question does not name another one."""
+        self._selected_item = path
         if not path:
-            self.selected_label.grid_remove()
+            self.selected_bar.grid_remove()
             return
         self.selected_text.set(f"Selected: {path}")
-        self.selected_label.grid()
+        self.selected_bar.grid()
+
+    def get_selected_item(self) -> str | None:
+        return self._selected_item
+
+    def clear_selected_item(self) -> None:
+        self.set_selected_item(None)
 
     def clear_quote(self) -> None:
         self._quote = ""
+        self._pending_quote = ""
+        self._hover_button.hide()
         self.quote_bar.grid_remove()
 
     def add_cleanup_actions(self, suggestions: list, on_delete: Callable) -> None:
@@ -230,10 +316,16 @@ class AssistantPanel(ttk.Frame):
             self.transcript.insert("end", "  ")
             self.transcript.insert("end", suggestion.path, ("code",))
             self.transcript.insert("end", f"\n{suggestion.title}. {suggestion.reason}\n")
-            label = "Empty Recycle Bin" if suggestion.action == "empty_recycle_bin" else (
-                "Delete contents permanently" if suggestion.contents_only else "Delete permanently"
-            )
-            button = ttk.Button(self.transcript, text=label, style="Danger.TButton", command=lambda item=suggestion: on_delete(item))
+            if suggestion.action.startswith("uninstall:"):
+                label = "Uninstall app"
+                btn_style = "Accent.TButton"
+            elif suggestion.action == "empty_recycle_bin":
+                label = "Empty Recycle Bin"
+                btn_style = "Danger.TButton"
+            else:
+                label = "Delete contents permanently" if suggestion.contents_only else "Delete permanently"
+                btn_style = "Danger.TButton"
+            button = ttk.Button(self.transcript, text=label, style=btn_style, command=lambda item=suggestion: on_delete(item))
             self.transcript.window_create("end", window=button, pady=2)
         self.transcript.see("end")
         self.transcript.configure(state="disabled")
@@ -256,6 +348,7 @@ class AssistantPanel(ttk.Frame):
     # ── AI response lifecycle ─────────────────────────────────────────
 
     def begin_reply(self) -> None:
+        self._hover_button.hide()
         self.write("SAGE", "")
         self._reply_mark = "assistant_reply"
         self.transcript.mark_set(self._reply_mark, "end-1c")
@@ -389,6 +482,7 @@ class AssistantPanel(ttk.Frame):
     # ── Context menu handlers ─────────────────────────────────────────
 
     def _show_transcript_menu(self, event: tk.Event) -> None:
+        self._hover_button.hide()
         has_sel = bool(self.transcript.tag_ranges("sel"))
         self._transcript_menu.entryconfigure("Copy", state="normal" if has_sel else "disabled")
         try:
@@ -449,7 +543,8 @@ class AssistantPanel(ttk.Frame):
         return "break"
 
     def destroy(self) -> None:
-        for job in (self._spinner_job, self._render_job, self._phase_job):
+        self._hover_button.hide()
+        for job in (self._spinner_job, self._render_job, self._phase_job, self._check_sel_job):
             if job:
                 self.after_cancel(job)
         super().destroy()

@@ -10,7 +10,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from ctypes import wintypes
 from functools import lru_cache
 
-from ...config import SIZE_PROGRESS_INTERVAL, SIZE_WORKERS
+from ...config import FILE_ATTRIBUTE_SPARSE_FILE, SIZE_PROGRESS_INTERVAL, SIZE_WORKERS
 from ...models import FileRecord, ScanResult
 
 FILE_READ_ATTRIBUTES = 0x00000080
@@ -212,6 +212,8 @@ def collect_file_sizes(
 
     def apply_one(record: FileRecord, data: tuple[int, int, str | None]) -> None:
         logical, allocated, error = data
+        if record.attributes & FILE_ATTRIBUTE_SPARSE_FILE:
+            logical = min(logical, allocated)
         record.logical_size = logical
         record.allocated_size = allocated
         record.size_error = error

@@ -102,7 +102,9 @@ class ScanEvidence:
                                         name = winreg.QueryValueEx(key, "DisplayName")[0]
                                         location = winreg.QueryValueEx(key, "InstallLocation")[0]
                                         if isinstance(name, str) and isinstance(location, str) and ntpath.isabs(location) and ntpath.dirname(ntpath.normpath(location)) != ntpath.normpath(location):
-                                            apps.append({"name": name[:100], "location": ntpath.normpath(location)})
+                                            norm_loc = ntpath.normpath(location)
+                                            if os.path.exists(norm_loc):
+                                                apps.append({"name": name[:100], "location": norm_loc})
                                 except OSError:
                                     continue
                     except OSError:
@@ -325,7 +327,12 @@ class ScanEvidence:
         "overview", "show", "size", "space", "storage", "tell", "use", "used", "uses", "using", "taking",
         "take", "worth", "hey", "hello", "hi", "these", "those", "them", "its", "itself", "safe", "free", "clear",
         "clean", "cleanup", "junk", "inside", "not", "avoid", "never", "shouldn", "t", "explain", "really", "so", "needed", "necessary", "sensitive", "private", "contains", "contain", "why", "where", "there", "here", "c", "d",
-        "am", "was", "were", "being", "good", "guy", "gay", "looking", "hot", "sexy", "idiot", "we", "they", "who", "was",
+        "am", "was", "were", "being", "good", "guy", "looking", "we", "they", "who",
+        "need", "needs", "want", "wants", "around", "approx", "approximately", "some", "any", "many", "more", "less",
+        "things", "thing", "stuff", "item", "items", "anything", "something", "everything", "nothing",
+        "up", "may", "might", "shall", "will", "get", "got",
+        "gb", "mb", "kb", "tb", "gig", "gigs", "gigabyte", "gigabytes", "megabyte", "megabytes", "byte", "bytes",
+        "safety", "harm", "break", "broken", "work", "fine", "ok", "okay", "sure", "all",
     })
 
     def _folder_index(self) -> dict[str, list[int]]:
@@ -349,12 +356,15 @@ class ScanEvidence:
     def loose_folders(self, name: str, scope: str | None = None, limit: int = 6) -> list[dict]:
         """Folders whose name matches once spaces and punctuation are ignored."""
         compact = "".join(_WORD.findall(name.casefold()))
-        if len(compact) < 2:
+        if len(compact) < 2 or compact.isdigit():
             return []
         found = []
         for frn in self._compact_folder_index().get(compact, ()):
             path = self.result.path_for(frn)
             if path and frn not in found and (scope is None or self.within(path, scope)):
+                p_lower = path.casefold()
+                if any(x in p_lower for x in ("\\.git\\", "\\$recycle.bin\\", "\\system volume information\\", "\\.svn\\", "\\.hg\\")):
+                    continue
                 if len(compact) == 2 and path.count("\\") > 2:
                     continue
                 found.append(frn)
@@ -366,6 +376,7 @@ class ScanEvidence:
         words = _WORD.findall(question.casefold())
         index = self._folder_index()
         found: list[int] = []
+        allow_internal = bool(re.search(r"\b(?:git|\.git|recycle|recycle\.bin)\b", question, re.I))
         quoted = [value for groups in re.findall(r'"([^"\n]+)"|`([^`\n]+)`|(?<!\w)\x27([^\x27\n]+)\x27', question) for value in groups if value]
         for name in quoted:
             for frn in index.get(_name_key(name), ()):
@@ -379,13 +390,27 @@ class ScanEvidence:
                     return found
                 if used.intersection(span):
                     continue
-                phrase = " ".join(words[start:start + width]).rstrip(".")
-                if width == 1 and phrase in self._IGNORED:
+                phrase_words = words[start:start + width]
+                if all(w in self._IGNORED or w.isdigit() for w in phrase_words):
+                    continue
+                phrase = " ".join(phrase_words).rstrip(".")
+                if phrase.isdigit():
+                    continue
+                if width == 1 and (phrase in self._IGNORED or len(phrase) <= 2 and phrase not in {"hp", "os", "ui", "db", "ai"}):
                     continue
                 matches = [frn for frn in index.get(phrase, ()) if frn not in found]
-                if matches:
+                valid_matches = []
+                for frn in matches:
+                    p = self.result.path_for(frn)
+                    if p:
+                        p_lower = p.casefold()
+                        if not allow_internal:
+                            if any(x in p_lower for x in ("\\.git\\", "\\$recycle.bin\\", "\\system volume information\\", "\\.svn\\", "\\.hg\\")):
+                                continue
+                        valid_matches.append(frn)
+                if valid_matches:
                     used.update(span)
-                    found.extend(matches[: limit - len(found)])
+                    found.extend(valid_matches[: limit - len(found)])
         return found
 
     def mentioned(self, question: str, limit: int = 6) -> dict:

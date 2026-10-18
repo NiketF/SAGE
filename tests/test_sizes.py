@@ -97,6 +97,21 @@ class SizeCollectionTests(unittest.TestCase):
         self.assertTrue(result.sizes_complete)
         self.assertEqual(result.directory_sizes[5], (5, 8))
 
+    def test_collect_file_sizes_clamps_sparse_file_logical_size(self):
+        from sage.config import FILE_ATTRIBUTE_SPARSE_FILE
+        records = {
+            5: FileRecord(5, 5, ".", FILE_ATTRIBUTE_DIRECTORY),
+            11: FileRecord(11, 5, "userdata.img", FILE_ATTRIBUTE_SPARSE_FILE),
+        }
+        result = build_scan_result(VolumeInfo("E:", "Data", "NTFS"), records)
+        with patch("sage.platform.windows.sizes.get_directory_file_sizes", return_value=[]):
+            with patch("sage.platform.windows.sizes.get_file_sizes", return_value=(512 * 1024**3, 0)):
+                collect_file_sizes(result)
+        self.assertEqual(records[11].logical_size, 0)
+        self.assertEqual(records[11].allocated_size, 0)
+        self.assertEqual(result.directory_sizes[5], (0, 0))
+
+
 
 if __name__ == "__main__":
     unittest.main()

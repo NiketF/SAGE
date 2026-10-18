@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 
-from ..config import FILE_ATTRIBUTE_DIRECTORY
+from ..config import FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_SPARSE_FILE
 from ..models import FileRecord, ScanResult, VolumeInfo
 
 NTFS_ROOT_FRN = 5
@@ -121,7 +121,10 @@ def calculate_directory_sizes(result: ScanResult) -> dict[int, tuple[int, int]]:
                 logical += child_logical
                 allocated += child_allocated
             else:
-                logical += child.logical_size
+                child_logical = child.logical_size
+                if child.attributes & FILE_ATTRIBUTE_SPARSE_FILE:
+                    child_logical = min(child_logical, child.allocated_size)
+                logical += child_logical
                 allocated += child.allocated_size
         totals[frn] = (logical, allocated)
     result.directory_sizes = totals

@@ -13,7 +13,12 @@ import struct
 from collections.abc import Callable, Iterator
 from ctypes import wintypes
 
-from ...config import FILE_ATTRIBUTE_DIRECTORY, MFT_BUFFER_SIZE, MFT_PROGRESS_INTERVAL
+from ...config import (
+    FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_SPARSE_FILE,
+    MFT_BUFFER_SIZE,
+    MFT_PROGRESS_INTERVAL,
+)
 from ...models import FileRecord
 
 FSCTL_GET_NTFS_VOLUME_DATA = 0x00090064
@@ -32,6 +37,8 @@ ATTR_STANDARD_INFORMATION = 0x10
 ATTR_FILE_NAME = 0x30
 ATTR_DATA = 0x80
 ATTR_REPARSE_POINT = 0xC0
+ATTR_FLAG_COMPRESSED = 0x0001
+ATTR_FLAG_SPARSE = 0x8000
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 # Junctions and symlinks set this tag bit; OneDrive, WOF-compressed and dedup files do not.
 REPARSE_TAG_NAME_SURROGATE = 0x20000000
@@ -177,6 +184,8 @@ def parse_mft_file_record(
         offset += attr_len
     if reparse_tag is not None and not reparse_tag & REPARSE_TAG_NAME_SURROGATE:
         attributes &= ~FILE_ATTRIBUTE_REPARSE_POINT
+    if attributes & FILE_ATTRIBUTE_SPARSE_FILE:
+        logical = min(logical, allocated)
     return (base_ref, sequence, is_directory, name, parent_frn, logical, allocated, modified, attributes)
 
 
@@ -207,8 +216,16 @@ def _unnamed_data_sizes(
         lowest_vcn = struct.unpack_from("<q", record, offset + 0x10)[0]
         if lowest_vcn != 0:
             return None
-        allocated = max(0, struct.unpack_from("<q", record, offset + 0x28)[0])
+        flags = struct.unpack_from("<H", record, offset + 0x0C)[0]
+        if flags & (ATTR_FLAG_COMPRESSED | ATTR_FLAG_SPARSE):
+            if offset + 0x48 > len(record):
+                return None
+            allocated = max(0, struct.unpack_from("<q", record, offset + 0x40)[0])
+        else:
+            allocated = max(0, struct.unpack_from("<q", record, offset + 0x28)[0])
         logical = max(0, struct.unpack_from("<q", record, offset + 0x30)[0])
+        if flags & ATTR_FLAG_SPARSE:
+            logical = min(logical, allocated)
         return logical, allocated
     value_len = struct.unpack_from("<I", record, offset + 0x10)[0]
     return max(0, value_len), 0
@@ -488,6 +505,9 @@ def enumerate_mft(
         extra = extension_sizes.get(frn & NTFS_RECORD_NUMBER_MASK)
         if extra and not record.is_directory and record.logical_size == 0 and record.allocated_size == 0:
             record.logical_size, record.allocated_size = extra
+            if record.attributes & FILE_ATTRIBUTE_SPARSE_FILE:
+                record.logical_size = min(record.logical_size, record.allocated_size)
+
 
     if progress:
         progress(len(records))

@@ -89,6 +89,37 @@ class MftParserTests(unittest.TestCase):
         self.assertEqual(parse_mft_file_record(folder)[3], "Docs")
         self.assertIsNone(parse_mft_file_record(unused))
 
+    def test_parses_sparse_nonresident_data_and_clamps_virtual_size(self):
+        # 512 GB virtual sparse file with 0 physical allocation (e.g. userdata.img)
+        sparse_virtual = 512 * 1024 * 1024 * 1024
+        file_record = make_mft_record(
+            pack_file_name("userdata.img", 5),
+            pack_sparse_nonresident_data(sparse_virtual, 0),
+        )
+        parsed = parse_mft_file_record(file_record)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[5:7], (0, 0))
+
+    def test_parses_compressed_nonresident_data_sizes(self):
+        # 10 MB logical file compressed to 3 MB allocated on disk
+        file_record = make_mft_record(
+            pack_file_name("archive.bin", 5),
+            pack_compressed_nonresident_data(10_000_000, 3_145_728, 10_485_760),
+        )
+        parsed = parse_mft_file_record(file_record)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[5:7], (10_000_000, 3_145_728))
+
+    def test_parses_sparse_nonresident_data_with_partial_allocation(self):
+        # 100 MB virtual sparse file with 4 MB physically allocated
+        file_record = make_mft_record(
+            pack_file_name("download.part", 5),
+            pack_sparse_nonresident_data(100_000_000, 4_194_304),
+        )
+        parsed = parse_mft_file_record(file_record)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[5:7], (4_194_304, 4_194_304))
+
     def test_reads_modified_time_attributes_and_only_keeps_link_reparse_flag(self):
         modified = 116444736000000000 + 1_700_000_000 * 10_000_000
         info = pack_resident_attr(0x10, struct.pack("<4QI", 0, modified, 0, 0, 0x400 | 0x2) + bytes(0x24))
@@ -96,6 +127,7 @@ class MftParserTests(unittest.TestCase):
         onedrive = make_mft_record(info, pack_file_name("cloud.docx", 5), pack_resident_attr(0xC0, struct.pack("<I", 0x9000001A)))
         self.assertEqual(parse_mft_file_record(junction)[7:], (1_700_000_000, 0x402))
         self.assertEqual(parse_mft_file_record(onedrive)[7:], (1_700_000_000, 0x2))
+
 
 
 def pack_resident_attr(attr_type: int, value: bytes) -> bytes:
@@ -148,6 +180,33 @@ def pack_nonresident_data(logical: int, allocated: int) -> bytes:
     struct.pack_into("<q", buf, 0x30, logical)
     struct.pack_into("<q", buf, 0x38, logical)
     return bytes(buf)
+
+
+def pack_sparse_nonresident_data(logical: int, allocated: int) -> bytes:
+    buf = bytearray(0x48)
+    struct.pack_into("<II", buf, 0, 0x80, 0x48)
+    buf[8] = 1
+    struct.pack_into("<H", buf, 0x0C, 0x8000)  # ATTR_FLAG_SPARSE
+    struct.pack_into("<H", buf, 0x20, 0x48)
+    struct.pack_into("<q", buf, 0x28, logical)
+    struct.pack_into("<q", buf, 0x30, logical)
+    struct.pack_into("<q", buf, 0x38, logical)
+    struct.pack_into("<q", buf, 0x40, allocated)  # TotalAllocated
+    return bytes(buf)
+
+
+def pack_compressed_nonresident_data(logical: int, compressed_allocated: int, uncompressed_allocated: int) -> bytes:
+    buf = bytearray(0x48)
+    struct.pack_into("<II", buf, 0, 0x80, 0x48)
+    buf[8] = 1
+    struct.pack_into("<H", buf, 0x0C, 0x0001)  # ATTR_FLAG_COMPRESSED
+    struct.pack_into("<H", buf, 0x20, 0x48)
+    struct.pack_into("<q", buf, 0x28, uncompressed_allocated)
+    struct.pack_into("<q", buf, 0x30, logical)
+    struct.pack_into("<q", buf, 0x38, logical)
+    struct.pack_into("<q", buf, 0x40, compressed_allocated)  # TotalAllocated
+    return bytes(buf)
+
 
 
 def make_mft_record(*attrs: bytes, flags: int = 1, sequence: int = 1, base: int = 0) -> bytearray:

@@ -516,10 +516,10 @@ class ConversationTests(unittest.TestCase):
         reply=a.answer('Explain this.',(r'E:\Project\config.json',),on_token=tokens.append)
         self.assertEqual(''.join(tokens),reply)
 
-    def test_partial_generation_is_labelled_and_has_action_confirmation(self):
+    def test_partial_generation_auto_continues_and_has_action_confirmation(self):
         a=self.make_assistant(lambda _: {'message':{'content':'This file may store project settings. Removing it could'},'done_reason':'length'})
         reply=a.answer('What happens if I remove it?',(r'E:\Project\config.json',))
-        self.assertIn('partial explanation',reply)
+        self.assertNotIn('partial explanation',reply)
         self.assertNotIn('Removing it could',reply)
         self.assertIn('No file was changed',reply)
 

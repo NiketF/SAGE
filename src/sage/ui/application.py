@@ -195,7 +195,7 @@ class SageApplication(tk.Tk):
         self._sort_box.grid(row=0, column=2, padx=(0, 8), pady=(4, 4))
         self._sort_box.bind("<<ComboboxSelected>>", self._on_sort_changed)
         ttk.Separator(left, orient="horizontal").grid(row=1, column=0, sticky="ew")
-        self.tree_panel = TreePanel(left, on_sort=self._sync_sort)
+        self.tree_panel = TreePanel(left, on_sort=self._sync_sort, on_ask_sage=self._on_tree_ask_sage)
         self.tree_panel.grid(row=2, column=0, sticky="nsew")
         self.tree_panel.tree.bind("<<TreeviewSelect>>", self._on_tree_selected)
         self.tree_panel.tree.bind("<Button-3>", self._show_tree_menu)
@@ -371,6 +371,10 @@ class SageApplication(tk.Tk):
                         self._conversation.remember_suggestions(event[4])
                     if len(event) > 5 and event[5]:
                         self.assistant_panel.add_open_buttons(event[5], self._open_settings)
+                    if len(event) > 6 and event[6]:
+                        new_target = event[6]
+                        if self.assistant_panel.get_selected_item() != new_target:
+                            self.assistant_panel.set_selected_item(new_target)
                 elif kind == "assistant_token":
                     self.assistant_panel.append_reply(event[3])
                 elif kind == "assistant_status":
@@ -478,12 +482,14 @@ class SageApplication(tk.Tk):
         self._assistant_request_id += 1
         request_id = self._assistant_request_id
         generation = self._generation
-        selected_paths = tuple(self._selected_paths())
+        active_item = self.assistant_panel.get_selected_item()
+        selected_paths = (active_item,) if active_item else ()
         self.assistant_panel.begin_reply()
 
         def worker() -> None:
             suggestions: list[CleanupSuggestion] = []
             links: list[dict] = []
+            new_focus: str | None = None
             try:
                 answer = conversation.answer(
                     question, selected_paths, quoted=quoted,
@@ -492,16 +498,22 @@ class SageApplication(tk.Tk):
                 )
                 suggestions = list(conversation.last_suggestions)
                 links = list(conversation.last_links)
+                if conversation.focus:
+                    new_focus = conversation.focus[0]
             except Exception as exc:
                 answer = f"Could not answer from the current scan: {exc}"
-            self._events.put(("assistant_answer", generation, request_id, answer, suggestions, links))
+            self._events.put(("assistant_answer", generation, request_id, answer, suggestions, links, new_focus))
 
         threading.Thread(target=worker, daemon=True, name="sage-local-ai").start()
         return None
 
     def _on_tree_selected(self, _event: object = None) -> None:
-        paths = self._selected_paths()
-        self.assistant_panel.set_selected_item(paths[0] if len(paths) == 1 else None)
+        pass
+
+    def _on_tree_ask_sage(self, path: str) -> None:
+        self.assistant_panel._hover_button.hide()
+        self.assistant_panel.set_selected_item(path)
+        self.assistant_panel.question.focus_set()
 
     def _selected_paths(self) -> list[str]:
         result = self._result
@@ -661,6 +673,20 @@ class SageApplication(tk.Tk):
     def _delete_suggestion(self, suggestion: CleanupSuggestion) -> None:
         result = self._result
         if result is None or self._file_operation_running:
+            return
+        if suggestion.action.startswith("uninstall:"):
+            uninstaller = suggestion.action[len("uninstall:"):].strip()
+            prompt = (
+                f"Launch uninstaller for {suggestion.title}?\n\n"
+                f"Location: {suggestion.path}\n\n"
+                "Windows will launch the official uninstaller for this program."
+            )
+            if messagebox.askyesno("Uninstall Application", prompt, parent=self):
+                try:
+                    subprocess.Popen(uninstaller, shell=True)
+                    self.assistant_panel.write("SAGE", f"Started uninstaller for {suggestion.title}. Rescan when done to see updated space.")
+                except Exception as exc:
+                    messagebox.showerror(APP_NAME, f"Could not launch uninstaller:\n{exc}")
             return
         if not any(s.path == suggestion.path for s in self._conversation.cleanup_suggestions()):
             messagebox.showinfo(APP_NAME, "That item is not in the current scan's cleanup list. Scan again for fresh suggestions.")

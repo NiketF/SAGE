@@ -66,6 +66,16 @@ class AssistantPanelTests(unittest.TestCase):
         buttons[0].invoke()
         self.assertEqual(clicked, [item])
 
+    def test_uninstall_action_button(self):
+        from sage.services.cleanup import CleanupSuggestion
+        item = CleanupSuggestion("C:\\Program Files\\App", "Test App", "Installed application.", 500 * 1024**2, action="uninstall:uninstall.exe")
+        clicked = []
+        self.panel.add_cleanup_actions([item], clicked.append)
+        buttons = [self.panel.transcript.nametowidget(name) for name in self.panel.transcript.window_names()]
+        self.assertEqual(buttons[0]["text"], "Uninstall app")
+        buttons[0].invoke()
+        self.assertEqual(clicked, [item])
+
     def test_selected_chat_text_is_sent_with_the_next_question(self):
         self.panel.write("SAGE", "C:\\Windows\\Temp holds 2 GB.")
         start = self.panel.transcript.search("C:\\Windows\\Temp", "1.0")

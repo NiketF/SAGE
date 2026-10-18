@@ -23,6 +23,7 @@ def attributes_text(attributes: int) -> str:
         (0x02, "H"),
         (0x04, "S"),
         (0x20, "A"),
+        (0x200, "P"),
         (0x400, "L"),
         (0x800, "C"),
         (0x4000, "E"),

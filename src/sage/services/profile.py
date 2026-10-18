@@ -6,6 +6,7 @@ import ctypes
 import heapq
 import ntpath
 import os
+import re
 import struct
 import time
 from collections.abc import Callable
@@ -76,10 +77,29 @@ def installed_apps() -> list[dict]:
                 if not location:
                     icon = str(values.get("DisplayIcon") or "").split(",")[0].strip().strip('"')
                     location = ntpath.dirname(icon) if icon.lower().endswith(".exe") else ""
+                uninstaller = str(values.get("UninstallString") or values.get("QuietUninstallString") or "").strip()
+                if location:
+                    loc_norm = ntpath.normpath(location)
+                    if uninstaller:
+                        m = re.match(r'^"?([^"]+?\.exe)"?', uninstaller, re.I)
+                        if m:
+                            u_dir = ntpath.normpath(ntpath.dirname(m.group(1)))
+                            drive, rest = ntpath.splitdrive(u_dir)
+                            if os.path.exists(u_dir) and rest.strip("\\"):
+                                if ntpath.normcase(loc_norm).startswith(ntpath.normcase(u_dir)) and len(u_dir) < len(loc_norm):
+                                    loc_norm = u_dir
+                    if ntpath.basename(loc_norm).lower() in {"bin", "cmd", "app", "application", "client", "core"}:
+                        parent_loc = ntpath.dirname(loc_norm)
+                        drive, rest = ntpath.splitdrive(parent_loc)
+                        if os.path.exists(parent_loc) and rest.strip("\\"):
+                            loc_norm = parent_loc
+                    location = loc_norm
                 folded = ntpath.normcase(ntpath.normpath(location)) if location else ""
                 parts = [part for part in folded.split("\\") if part]
                 if (len(parts) < 2 or (len(parts) == 2 and parts[1] in _CONTAINERS)
                         or "\\windows\\installer" in folded or "\\package cache" in folded):
+                    continue
+                if not os.path.exists(location):
                     continue
                 size = values.get("EstimatedSize")
                 installed = str(values.get("InstallDate") or "")
@@ -89,6 +109,8 @@ def installed_apps() -> list[dict]:
                     "name": str(name), "publisher": values.get("Publisher"), "version": values.get("DisplayVersion"),
                     "installed": installed or None, "location": ntpath.normpath(location),
                     "registry_size": format_bytes(int(size) * 1024) if isinstance(size, int) else None,
+                    "estimated_bytes": int(size) * 1024 if isinstance(size, int) else 0,
+                    "uninstall_string": uninstaller,
                 }
     return list(apps.values())
 
