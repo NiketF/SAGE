@@ -40,7 +40,8 @@ Match the consequence to the proposed action: deletion removes that copy; edits 
 Give a suitable alternative when relevant. Moving is not automatically safe: check application relocation support or affected references. For personal files, copying first can preserve the original; confirm the copy is complete before removing it. Never promise a backup or undo route that was not checked.
 Tree evidence covers retained scan records, not live use or every file's contents. Respect partial coverage, link exclusions and unknown sizes. Read-only attributes do not establish effective permissions. Distinguish observed file types from inferred purpose; do not turn an unperformed check into a failed check.
 
-For informational questions about folders or files (e.g. "what is X", "what does X do", "tell me about X", "what's inside X"):
+For informational questions about folders or files (e.g. "what is X", "what does X do", "tell me about X", "what's inside X", "what is in X", "what's in the users folder"):
+- Use {"calls":[{"name":"inspect_path","args":{"path":"..."}}]} to look up the folder first if evidence is not already in selected_items. NEVER use {"fact":"..."} for these questions.
 - Do NOT dump unsolicited lists of files to delete or external cleanup suggestions. The user only asked what the item is.
 - Structure your response cleanly:
   1. Briefly describe what the folder or file is, what purpose it serves, and summarize its contents (sizes, direct children, observed file types).
@@ -87,9 +88,14 @@ Do not assume a file is personal, unused or unneeded from its format. Describe w
 
 PROTOCOL = """
 Return one JSON object only. Choose ONE form:
-{"fact":"size"} for a pure factual question about the selected item. Other fields are listed in report_fact. Optional path only for another verified item. SAGE returns the exact fact without another model call.
+{"fact":"size"} ONLY for these exact pure numeric lookup questions: "how big is X" (fact=size), "what is the size of X" (fact=size), "when was X modified" (fact=modified), "how many files are in X" (fact=child_count). NEVER use {"fact":"..."} for "what is X", "what is in X", "what's inside X", "what can I delete in X", or any question about contents, purpose, or listing. Optional path only for another verified item. SAGE returns the exact fact without another model call.
 {"purpose":"Short lines describing the item and its use","answer":"Your assessment and bulleted recommendations (- )"} when evidence is sufficient. Both strings are model-written; SAGE puts purpose first separated by paragraphs. Advice about changing files needs this explanation, not just a fact. For a general conversation, purpose can be a acknowledgement.
 {"calls":[{"name":"tool_name","args":{}}]} when you need evidence. At most 3 calls. Use only the tools below and their allowed arguments. ? marks optional arguments. Tool results arrive as data; then give your answer.
+Correct protocol examples:
+  "what is in users?" → {"calls":[{"name":"inspect_path","args":{"path":"C:\\Users"}}]}
+  "what can I delete in program files?" → {"calls":[{"name":"inspect_path","args":{"path":"C:\\Program Files"}}]}
+  "how big is Downloads?" → {"fact":"size"}
+  "when was this modified?" → {"fact":"modified"}
 """
 
 
@@ -504,6 +510,9 @@ class DriveAssistant:
         items = unique_items
         lines=[]
         is_cleanup = self._is_cleanup_query(question) if question else False
+        is_listing = bool(question and re.search(
+            r"\b(?:what(?:'s|\s+is)\s+in|what(?:'s|\s+is)\s+inside|list|show|contents?\s+of|what\s+(?:files|folders)\s+(?:are\s+)?(?:in|inside))\b",
+            question, re.I))
         drive = self.result.volume.drive if self.result else "C:"
         for item in items[:1]:
             path=item.get('path')
@@ -517,9 +526,15 @@ class DriveAssistant:
             explanation=role.get('role')
             first=f'`{path}` is {"an" if kind[:1] in "aeiou" else "a"} {kind}.'
             if explanation and explanation!='Unresolved': first=f'`{path}` appears to be {explanation[:1].lower()+explanation[1:]}.'
-            if clues: first+=' It includes '+', '.join(f'`{n}`' for n in clues[:4])+'.'
             if size!='pending': first+=f' Space used: {size}.'
             lines.append(first)
+            # For listing questions, show children prominently
+            if is_listing and clues:
+                lines.append(f"**Contents of `{path}`** ({len(clues)} direct items shown):")
+                for n in clues[:8]:
+                    lines.append(f"- `{n}`")
+            elif clues:
+                lines.append('Direct items: ' + ', '.join(f'`{n}`' for n in clues[:6]) + ('...' if len(clues) > 6 else '.'))
             risk_info=item.get('cleanup_risk',{})
             risk=risk_info.get('risk')
             if risk=='protected':
@@ -546,8 +561,10 @@ class DriveAssistant:
                 else:
                     lines.append(f"There are files in `{path}` that can be cleaned up. Would you like to see which files you can delete to free up space?")
             else:
-                lines.append("Keep these items until their use is checked. No file was changed.")
-                if not is_cleanup:
+                if is_cleanup:
+                    lines.append(f"**Safety Verdict**: Requires your review. These items need verification before removal.")
+                    lines.append(f"Would you like to explore the largest files inside `{path}` or check whether anything here is safe to remove?")
+                elif not is_listing:
                     lines.append(f"Would you like to explore the largest files inside `{path}` or check whether any files here can be removed?")
         return '\n\n'.join(lines)
 
@@ -626,8 +643,13 @@ class DriveAssistant:
                 item=self.tools.call('inspect_path',{'path':path})
                 if 'error' not in item: items.append(item)
         self.tools.focus=[] if self.unresolved_paths and not verified_references else [item['path'] for item in items]
+        # Only carry previous_results forward when there is no new named target.
+        # If the user switched to a different folder/file, clear stale listed items so
+        # the model does not mix old context into the new answer.
+        include_prev = not references and not selection_changed
+        prev_results = compact(self.listed[:8]) if include_prev else []
         context={'scanned_drive':self.result.volume.drive,'scan_time':self.result.scanned_at.isoformat(),
-                 'current_time':int(time.time()),'selected_items':compact(items),'previous_results':compact(self.listed[:8]),
+                 'current_time':int(time.time()),'selected_items':compact(items),'previous_results':prev_results,
                  'index_status':self.index_status,'highlighted_text':quoted[:800],
                  'question_paths':references,'unresolved_paths':list(self.unresolved_paths),
                  'tree_selection':list(selected_paths[:4]),'selection_changed':selection_changed,
@@ -834,6 +856,9 @@ class DriveAssistant:
                     reply=re.sub(r'<think>.*?</think>','',reply,flags=re.S).strip().replace('\\\\','\\')
                     if re.search(r'\bI\s+(?:have\s+)?(?:deleted|removed|moved|renamed|modified|overwritten|executed)\b',reply,re.I):
                         raise ValueError('The model claimed a file operation that did not happen.')
+                    # Guard: internal tool names must never appear in user-visible replies.
+                    if re.search(r'\b(?:report_fact|inspect_path|list_folder|search_files|cleanup_candidates|find_duplicates|drive_overview)\b',reply):
+                        raise ValueError('Model leaked internal tool name into reply.')
                     if self.client.last_metrics.get('done_reason')=='length':
                         ends=list(re.finditer(r'[.!?](?:\s|$)',reply))
                         if not ends: raise ValueError('The explanation was incomplete.')
@@ -879,6 +904,8 @@ class DriveAssistant:
                     # Action confirmation is enforced by SAGE, never inferred from a model claim.
                     if re.search(r'\b(delete|remove|removing|erase|edit|modify|move|rename|overwrite|replace|cleanup|discard|purge|update|upgrade|extract)\b',question+' '+reply,re.I) and 'no file was changed' not in reply.casefold():
                         reply+=' No file was changed.'
+                    if 'report_fact' in reply:
+                        raise ValueError('Model leaked internal tool name into reply.')
                     self.last_timings['status']='model_answer'
                     return finish(reply)
                 if turn==2: raise ValueError('Investigation limit reached.')
