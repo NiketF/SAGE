@@ -562,9 +562,12 @@ class DriveAssistant:
                     lines.append(f"There are files in `{path}` that can be cleaned up. Would you like to see which files you can delete to free up space?")
             else:
                 if is_cleanup:
-                    lines.append(f"**Safety Verdict**: Requires your review. These items need verification before removal.")
+                    lines.append(f"**Safety Verdict**: Requires your review. These items need verification before removal. No file was changed.")
                     lines.append(f"Would you like to explore the largest files inside `{path}` or check whether anything here is safe to remove?")
-                elif not is_listing:
+                elif is_listing:
+                    pass  # listing question: description + children above are sufficient
+                else:
+                    lines.append("Keep these items until their use is checked. No file was changed.")
                     lines.append(f"Would you like to explore the largest files inside `{path}` or check whether any files here can be removed?")
         return '\n\n'.join(lines)
 
