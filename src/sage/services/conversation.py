@@ -46,25 +46,24 @@ For informational questions about folders or files (e.g. "what is X", "what does
 - Structure your response cleanly:
   1. Briefly describe what the folder or file is, what purpose it serves, and summarize its contents (sizes, direct children, observed file types).
   2. Clearly state its safety verdict (e.g. **Protected system directory**, **Installed application**, **Requires user review**, or **Safe for cleanup**).
-  3. End by conversationally asking a relevant, proactive follow-up question tailored to the item:
-     - If the folder is a protected system folder (e.g. Recovery, Windows, Program Files, System Volume Information, ProgramData) and cannot be deleted:
+  3. ALWAYS end by conversationally asking a relevant follow-up question offering cleanup suggestions:
+     - For protected system folders (e.g. Recovery, Windows, Program Files, System Volume Information, ProgramData):
        Ask: "This folder is protected by Windows. Would you like some suggestions for safe places on this drive to free up space instead?"
-     - If the folder contains deletable items (caches, temporary files, logs):
+     - For folders with deletable items, caches, or temporary files:
        Ask: "There are cache and temporary files inside this folder that can be cleaned up. Would you like to see which files you can safely delete to free up space?"
-     - If the folder belongs to an installed application or game:
-       Ask: "Would you like to check how much space this application uses, or see options to safely uninstall it?"
-     - If the folder contains personal/user files (e.g. Downloads, Documents, Videos):
-       Ask: "This folder stores personal files. Would you like to see the largest files inside it, or check for old installers and duplicates?"
-     - If the folder is a development workspace or project:
-       Ask: "This looks like a development project. Would you like me to check for rebuildable dependency caches (like virtual environments or package caches) that can be cleared?"
+     - For installed applications or games:
+       Ask: "Would you like options to safely uninstall or clear data for this application to free up space?"
+     - For personal or user folders:
+       Ask: "Would you like to check for large files, old installers, or items you can delete here to free up space?"
+     - For any other folder or file:
+       Ask: "Want some suggestions for files you can safely delete to free up space?"
 
-For explicit cleanup, deletion, or freeing space questions (e.g. "can I delete X", "what can I delete here", "how do I free space", or when the user answers "yes" to your cleanup suggestion):
+For explicit cleanup, deletion, or freeing space questions (e.g. "can I delete X", "what can I delete here", "how do I free space", or when the user answers "yes" / positively to your follow-up cleanup question):
 - Do not write a single boring, dense paragraph.
 - Structure your response cleanly:
   1. Clearly state the safety verdict and the consequences of removing or cleaning the item.
-  2. Provide actionable suggestions formatted with markdown bullet points (`- `):
-     - If the item or folder has deletable sub-items, list them with paths and sizes.
-     - If the folder is protected, clearly state not to delete the folder itself, and provide bullet points with safe cleanup candidates outside the folder (e.g. Windows Temp, Downloads, browser caches, or removable apps).
+  2. If the folder or item has safe deletable files or caches, list them with markdown bullet points (`- `) with exact paths and sizes.
+  3. If no safe deletable files exist directly inside this folder (or if the folder is protected), clearly state that there is nothing safe to delete directly inside it (e.g. "Oops, this folder has nothing safe to delete directly."), and then provide bulleted suggestions for safe alternative cleanup locations on the drive (e.g. Windows Temp, Downloads, browser caches, or removable apps).
 
 Use general technical knowledge to explain observed file formats. Use the user's stated needs to explain why a file might be needed. Do not assume a file is personal, unused or unneeded from its format. Keep apps, environments, system data and needed project inputs in place. Review personal files first.
 A folder label is not proof of an application name; describe a likely role without inventing an owner.
@@ -325,8 +324,9 @@ class DriveAssistant:
             last_turn = self.history[-1]
             if last_turn.get('role') == 'assistant':
                 last_reply = last_turn.get('content', '').lower()
-                if any(phrase in last_reply for phrase in ("suggestions for safe places", "suggestions to free up", "free up space", "files you can safely delete", "files you can delete", "items you can clean")):
-                    if re.match(r"^\s*(?:yes|yeah|yep|sure|ok|okay|please|show me|yes please|go ahead|tell me|give me|do it|suggest)\b", q):
+                affirmation = bool(re.match(r"^\s*(?:y|yes|yeah|yep|yup|sure|ok|okay|please|show me|yes please|go ahead|tell me|give me|do it|suggest|definitely|of course|why not|absolutely)\b", q))
+                if affirmation:
+                    if '?' in last_reply or any(phrase in last_reply for phrase in ("suggestions", "free up space", "delete", "clean", "remove", "explore", "check")):
                         return True
         return False
 
@@ -350,9 +350,10 @@ class DriveAssistant:
             return False
         if self.history and len(q.split()) <= 4:
             valid_followup = (
-                r"\b(?:yes|no|yeah|yep|nope|sure|ok|okay|editing|gaming|work|school|personal|"
-                r"testing|dev|development|backup|archive|photos|videos|music|documents|code|"
-                r"first|second|third|1|2|3|both|neither|all|none)\b"
+                r"^(?:y|yes|no|yeah|yep|yup|nope|nah|sure|ok|okay|please|definitely|absolutely|"
+                r"show me|go ahead|tell me more|give me suggestions|do it|suggest|why not|of course|"
+                r"editing|gaming|work|school|personal|testing|dev|development|backup|archive|"
+                r"photos|videos|music|documents|code|first|second|third|1|2|3|both|neither|all|none)(?:[!.?,\s]|$)"
             )
             if re.search(valid_followup, q):
                 return False
@@ -537,13 +538,15 @@ class DriveAssistant:
                 lines.append('Direct items: ' + ', '.join(f'`{n}`' for n in clues[:6]) + ('...' if len(clues) > 6 else '.'))
             risk_info=item.get('cleanup_risk',{})
             risk=risk_info.get('risk')
+            scoped=self.evidence.cleanup_candidates(path, limit=3).get('items', []) if self.evidence else []
             if risk=='protected':
                 lines.append(f"**Safety Verdict**: **Protected {kind}**. Do not delete `{path}`. Removing it will cause operating system or installed applications to fail.")
                 if is_cleanup:
-                    lines.append("**Suggested items to delete to free up space**:")
-                    cands=self.evidence.cleanup_candidates(drive+"\\",limit=3).get('items',[]) if self.evidence else []
-                    if cands:
-                        for c in cands:
+                    lines.append(f"Oops, `{path}` is protected and has nothing safe to delete directly.")
+                    alt_cands=self.evidence.cleanup_candidates(drive+"\\",limit=3).get('items',[]) if self.evidence else []
+                    if alt_cands:
+                        lines.append("**Here are a few suggestions to free up space on this drive instead**:")
+                        for c in alt_cands:
                             lines.append(f"- `{c['path']}`: {c.get('allocated_display','')} ({c.get('cleanup_risk',{}).get('guidance','Safe cleanup candidate')})")
                     else:
                         lines.append("- Windows Temporary Files (`%TEMP%`)")
@@ -553,22 +556,39 @@ class DriveAssistant:
             elif risk=='managed_cleanup':
                 lines.append(f"**Safety Verdict**: **Safe for managed cleanup**. {risk_info.get('guidance','Eligible for cleanup.')}")
                 if is_cleanup:
-                    scoped = self.evidence.cleanup_candidates(path, limit=3).get('items', []) if self.evidence else []
                     if scoped:
                         lines.append("**Deletable items in this folder**:")
                         for c in scoped:
                             lines.append(f"- `{c['path']}`: {c.get('allocated_display', '')}")
+                    else:
+                        lines.append(f"Oops, `{path}` currently has no items eligible for cleanup.")
+                        alt_cands=self.evidence.cleanup_candidates(drive+"\\",limit=3).get('items',[]) if self.evidence else []
+                        if alt_cands:
+                            lines.append("**Here are a few suggestions to free up space on this drive instead**:")
+                            for c in alt_cands:
+                                lines.append(f"- `{c['path']}`: {c.get('allocated_display','')} ({c.get('cleanup_risk',{}).get('guidance','Safe cleanup candidate')})")
                 else:
                     lines.append(f"There are files in `{path}` that can be cleaned up. Would you like to see which files you can delete to free up space?")
             else:
                 if is_cleanup:
-                    lines.append(f"**Safety Verdict**: Requires your review. These items need verification before removal. No file was changed.")
-                    lines.append(f"Would you like to explore the largest files inside `{path}` or check whether anything here is safe to remove?")
+                    if scoped:
+                        lines.append(f"**Safety Verdict**: Requires your review. These items need verification before removal. No file was changed.")
+                        lines.append("**Deletable items in this folder**:")
+                        for c in scoped:
+                            lines.append(f"- `{c['path']}`: {c.get('allocated_display', '')}")
+                    else:
+                        lines.append(f"Oops, `{path}` has nothing safe to delete directly.")
+                        alt_cands=self.evidence.cleanup_candidates(drive+"\\",limit=3).get('items',[]) if self.evidence else []
+                        if alt_cands:
+                            lines.append("**Here are a few suggestions to free up space on this drive instead**:")
+                            for c in alt_cands:
+                                lines.append(f"- `{c['path']}`: {c.get('allocated_display','')} ({c.get('cleanup_risk',{}).get('guidance','Safe cleanup candidate')})")
+                        lines.append("No file was changed.")
                 elif is_listing:
-                    pass  # listing question: description + children above are sufficient
+                    lines.append(f"Want some suggestions for files you can safely delete in `{path}`?")
                 else:
                     lines.append("Keep these items until their use is checked. No file was changed.")
-                    lines.append(f"Would you like to explore the largest files inside `{path}` or check whether any files here can be removed?")
+                    lines.append(f"Want some suggestions for files you can safely delete in `{path}`?")
         return '\n\n'.join(lines)
 
     def answer(self,question,selected_paths=(),*,quoted='',on_token=None,on_status=None):

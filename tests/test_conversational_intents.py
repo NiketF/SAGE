@@ -237,5 +237,50 @@ class ConversationalIntentTests(unittest.TestCase):
         self.assertNotIn('storage and drive analysis assistant', reply)
 
 
+    def test_conversational_followup_question_and_positive_affirmation_flow(self):
+        c_scan = make_scan({
+            'Recovery/Customizations/file.bin': 50000000,
+            'Downloads/setup.exe': 100000000,
+            'Temp/cache.tmp': 20000000,
+        }, drive='C:')
+        def unavailable(_): raise RuntimeError('Model unavailable')
+        client = OllamaClient(transport=unavailable)
+        assistant = DriveAssistant(c_scan, client, self.index)
+
+        # 1. Informational query about C:\Recovery
+        reply1 = assistant.answer('what is recovery?', ())
+        self.assertIn('Recovery', reply1)
+        self.assertIn('Protected', reply1)
+        # SAGE should ask a follow-up question
+        self.assertIn('?', reply1)
+        # SAGE should NOT dump cleanup candidates proactively
+        self.assertNotIn('setup.exe', reply1)
+
+        # 2. User responds affirmatively ("yes")
+        reply2 = assistant.answer('yes', ())
+        # Should now provide suggestions because user confirmed
+        self.assertIn(r'Oops, `C:\Recovery` is protected and has nothing safe to delete directly', reply2)
+        self.assertIn('suggestions to free up space', reply2.lower())
+
+    def test_folder_with_nothing_to_delete_gives_alternative_suggestions_on_yes(self):
+        c_scan = make_scan({
+            'MyFolder/important.docx': 1000000,
+            'Downloads/big_installer.exe': 500000000,
+        }, drive='C:')
+        def unavailable(_): raise RuntimeError('Model unavailable')
+        client = OllamaClient(transport=unavailable)
+        assistant = DriveAssistant(c_scan, client, self.index)
+
+        # 1. Ask what is in MyFolder
+        reply1 = assistant.answer('what is in MyFolder?', ())
+        self.assertIn('important.docx', reply1)
+        self.assertIn('?', reply1)
+
+        # 2. User confirms with positive affirmation ("sure")
+        reply2 = assistant.answer('sure', ())
+        self.assertIn(r'Oops, `C:\MyFolder` has nothing safe to delete directly', reply2)
+        self.assertIn('suggestions to free up space', reply2.lower())
+        self.assertIn('No file was changed', reply2)
+
 if __name__ == '__main__':
     unittest.main()
