@@ -94,7 +94,7 @@ class SageApplication(tk.Tk):
 
         def worker() -> None:
             try:
-                OllamaClient().warm([{'role':'system','content':self._conversation.system_prompt()}])
+                self._conversation.client.warm([{'role':'system','content':self._conversation.system_prompt()}])
                 status = "Ready for your question."
             except RuntimeError:
                 status = "Local AI unavailable — basic scan answers still work"
@@ -419,6 +419,8 @@ class SageApplication(tk.Tk):
             self.assistant_panel.finish_reply("The new drive tree is ready. Please ask your question again.")
             self._assistant_busy = False
         self._conversation = ConversationAssistant(result)
+        if hasattr(self, "_warm_ai"):
+            self._warm_ai()
         self.tree_panel.show_result(result)
         self.assistant_panel.set_selected_item(None)
         self._update_drive_info()

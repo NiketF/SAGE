@@ -203,5 +203,39 @@ class ConversationalIntentTests(unittest.TestCase):
                         msg=f"Expected game/cache sub-items in context, got: {paths_in_ctx}")
 
 
+    def test_sensitive_hate_query_handled_with_utmost_care_without_folder_match(self):
+        android_scan = make_scan({
+            'AppData/Local/Android/Sdk/sources/android-36.1/android/app/people/PeopleSpaceTile.java': 24000,
+            'AppData/Local/Android/Sdk/sources/android-36.1/android/app/people/ConversationStatus.java': 12000,
+        }, drive='C:')
+        assistant = DriveAssistant(android_scan, self.client, self.index)
+        reply = assistant.answer('black people are bad', ())
+        self.assertEqual(assistant.focus, [])
+        self.assertEqual(len(self.transport_calls), 0)
+        self.assertIn('storage and drive analysis assistant', reply)
+        self.assertIn('do not support discrimination', reply.lower())
+        self.assertNotIn('PeopleSpaceTile', reply)
+        self.assertNotIn('android\\app\\people', reply.lower())
+
+    def test_same_basename_folders_resolve_to_shallowest_root_folder(self):
+        recovery_scan = make_scan({
+            'Recovery/Customizations/file.bin': 50000000,
+            'Windows/Panther/Rollback/EFI/Microsoft/Recovery/BCD': 50000,
+        }, drive='C:')
+        assistant = DriveAssistant(recovery_scan, self.client, self.index)
+        assistant.answer('what does this recovery actually do?', ())
+        self.assertEqual(assistant.focus, [r'C:\Recovery'])
+
+    def test_what_is_oem_folder_is_recognized_and_inspected(self):
+        oem_scan = make_scan({
+            'OEM/recovery.img': 280000000,
+            'Program Files/app.exe': 10000000,
+        }, drive='C:')
+        assistant = DriveAssistant(oem_scan, self.client, self.index)
+        reply = assistant.answer('what is OEM', ())
+        self.assertEqual(assistant.focus, [r'C:\OEM'])
+        self.assertNotIn('storage and drive analysis assistant', reply)
+
+
 if __name__ == '__main__':
     unittest.main()

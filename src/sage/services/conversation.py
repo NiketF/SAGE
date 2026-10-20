@@ -19,6 +19,15 @@ from .profile import installed_apps
 from .cleanup import CleanupSuggestion
 from .evidence import format_bytes
 
+_NOT_A_FOLDER_WORDS = frozenset({
+    "people", "person", "human", "good", "bad", "black", "white", "guy", "guys",
+    "gay", "being", "looking", "hot", "sexy", "idiot", "weather", "love", "hate",
+    "pretty", "beautiful", "ugly", "cute", "handsome", "attractive", "marry", "kiss",
+    "date", "great", "better", "best", "worst", "like", "actually", "know", "mean",
+    "also", "just", "make", "think", "world", "state", "problem", "fact", "life",
+    "day", "year", "work", "school", "music", "all", "fine", "cool", "nice", "real"
+})
+
 INSTRUCTIONS = """You are SAGE, a conversational assistant for this scanned drive.
 For pure size, count or modification-date questions use the compact fact JSON form below, even when evidence has the value. Omit path for one selected item. SAGE supplies the exact answer. Do not interpret modification as creation or access.
 Advice about removing or changing files needs an explanation, not just a measurement. Do not call report_fact for advice if supplied evidence already has the needed size. Otherwise use final=false to gather a fact and then explain.
@@ -31,14 +40,30 @@ Match the consequence to the proposed action: deletion removes that copy; edits 
 Give a suitable alternative when relevant. Moving is not automatically safe: check application relocation support or affected references. For personal files, copying first can preserve the original; confirm the copy is complete before removing it. Never promise a backup or undo route that was not checked.
 Tree evidence covers retained scan records, not live use or every file's contents. Respect partial coverage, link exclusions and unknown sizes. Read-only attributes do not establish effective permissions. Distinguish observed file types from inferred purpose; do not turn an unperformed check into a failed check.
 
-For advice about deleting, cleaning up, or freeing space:
+For informational questions about folders or files (e.g. "what is X", "what does X do", "tell me about X", "what's inside X"):
+- Do NOT dump unsolicited lists of files to delete or external cleanup suggestions. The user only asked what the item is.
+- Structure your response cleanly:
+  1. Briefly describe what the folder or file is, what purpose it serves, and summarize its contents (sizes, direct children, observed file types).
+  2. Clearly state its safety verdict (e.g. **Protected system directory**, **Installed application**, **Requires user review**, or **Safe for cleanup**).
+  3. End by conversationally asking a relevant, proactive follow-up question tailored to the item:
+     - If the folder is a protected system folder (e.g. Recovery, Windows, Program Files, System Volume Information, ProgramData) and cannot be deleted:
+       Ask: "This folder is protected by Windows. Would you like some suggestions for safe places on this drive to free up space instead?"
+     - If the folder contains deletable items (caches, temporary files, logs):
+       Ask: "There are cache and temporary files inside this folder that can be cleaned up. Would you like to see which files you can safely delete to free up space?"
+     - If the folder belongs to an installed application or game:
+       Ask: "Would you like to check how much space this application uses, or see options to safely uninstall it?"
+     - If the folder contains personal/user files (e.g. Downloads, Documents, Videos):
+       Ask: "This folder stores personal files. Would you like to see the largest files inside it, or check for old installers and duplicates?"
+     - If the folder is a development workspace or project:
+       Ask: "This looks like a development project. Would you like me to check for rebuildable dependency caches (like virtual environments or package caches) that can be cleared?"
+
+For explicit cleanup, deletion, or freeing space questions (e.g. "can I delete X", "what can I delete here", "how do I free space", or when the user answers "yes" to your cleanup suggestion):
 - Do not write a single boring, dense paragraph.
 - Structure your response cleanly:
-  1. Briefly describe what the folder or file is and what role it serves.
-  2. Clearly state the safety verdict (e.g. **Protected system directory**, **Safe to delete**, or **Requires user review**) and explain what happens if removed.
-  3. Provide actionable suggestions formatted with markdown bullet points (`- `):
-     - If the user asks about a specific folder or what to delete, list specific deletable sub-items inside it (e.g. caches, temporary files, logs, or unneeded applications with their paths and sizes).
-     - If the folder is protected (such as ProgramData, Program Files, Windows) or cannot be safely deleted as a whole, state clearly not to delete the folder itself, and provide bullet points suggesting safe cleanup candidates outside the folder on the drive (e.g. Windows Temp, Downloads, browser caches, pip cache, or removable apps).
+  1. Clearly state the safety verdict and the consequences of removing or cleaning the item.
+  2. Provide actionable suggestions formatted with markdown bullet points (`- `):
+     - If the item or folder has deletable sub-items, list them with paths and sizes.
+     - If the folder is protected, clearly state not to delete the folder itself, and provide bullet points with safe cleanup candidates outside the folder (e.g. Windows Temp, Downloads, browser caches, or removable apps).
 
 Use general technical knowledge to explain observed file formats. Use the user's stated needs to explain why a file might be needed. Do not assume a file is personal, unused or unneeded from its format. Keep apps, environments, system data and needed project inputs in place. Review personal files first.
 A folder label is not proof of an application name; describe a likely role without inventing an owner.
@@ -281,15 +306,23 @@ class DriveAssistant:
             return True
         return False
 
-    @staticmethod
-    def _is_cleanup_query(question: str) -> bool:
-        q = question.lower()
-        return bool(re.search(
+    def _is_cleanup_query(self, question: str) -> bool:
+        q = question.lower().strip()
+        if bool(re.search(
             r"\b(?:delete|deletion|remove|removal|erase|wipe|clean|cleanup|free|uninstall|uninstaller|"
             r"safe to delete|what can i delete|what to delete|what should i delete|space hogs|"
             r"can i delete|should i delete|can we delete|safe to remove)\b",
             q
-        ))
+        )):
+            return True
+        if self.history:
+            last_turn = self.history[-1]
+            if last_turn.get('role') == 'assistant':
+                last_reply = last_turn.get('content', '').lower()
+                if any(phrase in last_reply for phrase in ("suggestions for safe places", "suggestions to free up", "free up space", "files you can safely delete", "files you can delete", "items you can clean")):
+                    if re.match(r"^\s*(?:yes|yeah|yep|sure|ok|okay|please|show me|yes please|go ahead|tell me|give me|do it|suggest)\b", q):
+                        return True
+        return False
 
     def _is_off_topic(self, question: str) -> bool:
         q = question.strip().lower()
@@ -326,7 +359,7 @@ class DriveAssistant:
             r"scan|scanned|scanning|rescan|ntfs|mft|"
             r"install|installed|uninstall|uninstaller|app|apps|application|applications|program|programs|software|"
             r"game|games|temp|temporary|cache|caches|log|logs|backup|backups|"
-            r"windows|system32|appdata|users|program files|recycle bin|"
+            r"windows|system32|appdata|users|program files|recycle bin|recovery|reagent|oem|perflogs|sysreset|inetpub|fraps|ntfs|mft|fat32|exfat|pagefile|hiberfil|winsxs|prefetch|guid|gpt|mbr|bios|uefi|partition|partitions|volume|volumes|"
             r"setting|settings|config|configs|configuration|configurations|project|projects|code|"
             r"modify|modifying|rename|renaming|move|moving|relocate|relocating|extract|extracting|unpack|unpacking|"
             r"edit|editing|update|updating|replace|replacing|change|changing|affect|affecting|"
@@ -336,6 +369,17 @@ class DriveAssistant:
         if re.search(domain_terms, q):
             return False
         return True
+
+    @staticmethod
+    def _is_sensitive_or_hateful(question: str) -> bool:
+        q = question.lower()
+        hate_or_bias = (
+            r"\b(?:black people|white people|asian people|jewish people|muslims|christians|hindus|"
+            r"gay people|trans people|women|men|minorities)\s+(?:are|is)\s+(?:bad|evil|inferior|subhuman|stupid|trash|worst|monsters|animals|dirty|terrible|hate)\b|"
+            r"\b(?:hate|kill|exterminate|destroy|subhuman)\s+(?:all\s+)?(?:blacks?|whites?|asians?|jews?|muslims?|gays?|trans|women|men)\b|"
+            r"\b(?:nigger|faggot|chink|kike|retard|spic)\b"
+        )
+        return bool(re.search(hate_or_bias, q))
 
     def _find_named_targets(self, question: str, active_selection: tuple = ()) -> list[str]:
         if not self.result or not self.evidence:
@@ -377,7 +421,7 @@ class DriveAssistant:
                 phrase_compact = "".join(phrase_words)
                 if phrase_space.isdigit() or phrase_compact.isdigit():
                     continue
-                if width == 1 and (phrase_space in self.evidence._IGNORED
+                if width == 1 and (phrase_space in self.evidence._IGNORED or phrase_space in _NOT_A_FOLDER_WORDS
                                    or (len(phrase_space) <= 2 and phrase_space not in {"hp", "os", "ui", "db", "ai", "c:", "d:"})):
                     continue
                 # Try exact spaced name first, then compact (no-spaces) name
@@ -411,15 +455,24 @@ class DriveAssistant:
                     if p and p not in found_paths and is_valid_target(p):
                         found_paths.append(p)
 
-        # Phase 3: if multiple results and one exactly matches the selection, prefer it;
-        # otherwise if all found results are children of the selection, narrow to them.
-        if active_selection and len(found_paths) > 1:
-            for p in found_paths:
-                if p.casefold() == active_selection[0].casefold():
-                    return [p]
-            inside = [p for p in found_paths if self.evidence.within(p, active_selection[0]) and p != active_selection[0]]
-            if inside:
-                return inside
+        # Phase 3: collapse same-name matches to the shallowest location.
+        if len(found_paths) > 1:
+            by_name: dict[str, list[str]] = {}
+            for path in found_paths:
+                by_name.setdefault(ntpath.basename(path).casefold(), []).append(path)
+            preferred = []
+            for matches in by_name.values():
+                if len(matches) == 1:
+                    preferred.extend(matches)
+                    continue
+                selected_name = active_selection[0].casefold() if active_selection else None
+                selection_refers = bool(re.search(r"\b(?:this|that|here|selected)\b", question, re.I))
+                preferred.append(min(matches, key=lambda path: (
+                    0 if selection_refers and path.casefold() == selected_name else 1,
+                    len([part for part in ntpath.normpath(path).split("\\") if part]),
+                    path.casefold(),
+                )))
+            found_paths = preferred
         return found_paths
 
 
@@ -435,14 +488,24 @@ class DriveAssistant:
             on_token(reply)
         return reply
 
-    def _fallback(self,items,reason):
+    def _fallback(self,items,reason,question=""):
         if self.unresolved_paths:
             paths=', '.join('`'+path+'`' for path in self.unresolved_paths[:3])
             return f'{paths} was not verified in this scan. Check the requested paths or scan their drive before an assessment.'
         if not items:
             return 'Local AI is not ready. Select a file or folder, or provide its exact path, so I can show its scan facts.'
+        unique_items = []
+        seen_names = set()
+        for item in items:
+            name = ntpath.basename(item.get('path', '')).casefold()
+            if name not in seen_names:
+                seen_names.add(name)
+                unique_items.append(item)
+        items = unique_items
         lines=[]
-        for item in items[:2]:
+        is_cleanup = self._is_cleanup_query(question) if question else False
+        drive = self.result.volume.drive if self.result else "C:"
+        for item in items[:1]:
             path=item.get('path')
             if not path: continue
             kind=item.get('kind','item')
@@ -461,24 +524,36 @@ class DriveAssistant:
             risk=risk_info.get('risk')
             if risk=='protected':
                 lines.append(f"**Safety Verdict**: **Protected {kind}**. Do not delete `{path}`. Removing it will cause operating system or installed applications to fail.")
-                lines.append("**Suggested items to delete to free up space**:")
-                drive=self.result.volume.drive if self.result else "C:"
-                cands=self.evidence.cleanup_candidates(drive+"\\",limit=3).get('items',[]) if self.evidence else []
-                if cands:
-                    for c in cands:
-                        lines.append(f"- `{c['path']}`: {c.get('allocated_display','')} ({c.get('cleanup_risk',{}).get('guidance','Safe cleanup candidate')})")
+                if is_cleanup:
+                    lines.append("**Suggested items to delete to free up space**:")
+                    cands=self.evidence.cleanup_candidates(drive+"\\",limit=3).get('items',[]) if self.evidence else []
+                    if cands:
+                        for c in cands:
+                            lines.append(f"- `{c['path']}`: {c.get('allocated_display','')} ({c.get('cleanup_risk',{}).get('guidance','Safe cleanup candidate')})")
+                    else:
+                        lines.append("- Windows Temporary Files (`%TEMP%`)")
+                        lines.append("- Unused applications via Windows Settings")
                 else:
-                    lines.append("- Windows Temporary Files (`%TEMP%`)")
-                    lines.append("- Unused applications via Windows Settings")
+                    lines.append(f"`{path}` is a protected system folder. Would you like some suggestions for safe places on drive {drive} to free up space instead?")
             elif risk=='managed_cleanup':
                 lines.append(f"**Safety Verdict**: **Safe for managed cleanup**. {risk_info.get('guidance','Eligible for cleanup.')}")
+                if is_cleanup:
+                    scoped = self.evidence.cleanup_candidates(path, limit=3).get('items', []) if self.evidence else []
+                    if scoped:
+                        lines.append("**Deletable items in this folder**:")
+                        for c in scoped:
+                            lines.append(f"- `{c['path']}`: {c.get('allocated_display', '')}")
+                else:
+                    lines.append(f"There are files in `{path}` that can be cleaned up. Would you like to see which files you can delete to free up space?")
             else:
                 lines.append("Keep these items until their use is checked. No file was changed.")
+                if not is_cleanup:
+                    lines.append(f"Would you like to explore the largest files inside `{path}` or check whether any files here can be removed?")
         return '\n\n'.join(lines)
 
     def answer(self,question,selected_paths=(),*,quoted='',on_token=None,on_status=None):
         started=time.monotonic()
-        deadline=started+OLLAMA_TIMEOUT_SECONDS
+        deadline=started+60
         self.last_suggestions=[]
         self.last_links=[]
         self.last_timings={'model_calls':0,'tool_calls':0}
@@ -491,8 +566,6 @@ class DriveAssistant:
         if selection_changed:self.unresolved_paths=[]
         self._last_selection=tuple(selected_paths)
         active_selection=selected_paths if selection_changed or not self.focus else tuple(self.focus)
-        if not references:
-            references = self._find_named_targets(question, active_selection)
         def finish(text,allow_suggestions=True):
             if on_token and streamed and text.startswith(displayed):
                 on_token(text[len(displayed):])
@@ -500,20 +573,39 @@ class DriveAssistant:
             return self._finish(question,text,started,None if streamed else on_token,target_paths=target_paths,allow_suggestions=allow_suggestions)
         if not self.result:
             return finish('Scan a drive first so I can answer from its files and folders.',allow_suggestions=False)
-        if not references:
-            named_target = LegacyAssistant._name_in(question)
-            if named_target and (re.search(r"\.[a-zA-Z0-9]{1,10}$", named_target) or re.search(r'["\'\x60]', question)):
-                self.unresolved_paths = [named_target]
-                self.tools.focus = []
-                self.last_context = {'scanned_drive': self.result.volume.drive, 'unresolved_paths': list(self.unresolved_paths)}
-                return finish(f"`{named_target}` does not exist on this drive.",allow_suggestions=False)
+        if self._is_sensitive_or_hateful(question):
+            return finish("I do not support discrimination, bias, or hate speech against any group of people. As SAGE, I am a storage and drive analysis assistant. Please let me know if you would like help inspecting files, analyzing storage, or freeing up disk space.", allow_suggestions=False)
+        if not references and re.match(r"^\s*(?:no|nope|nah|no thanks|not now|no thank you)\b", question.lower().strip()):
+            return finish("Understood! Let me know if you would like to inspect any other folder, check large files, or ask questions about your drive.", allow_suggestions=False)
         if not references and self._is_greeting(question):
             drive=self.result.volume.drive if self.result else ""
             reply=(f"Hello! I am SAGE, your drive and storage assistant. How can I help you inspect or clean up files on drive {drive}?"
                    if drive else "Hello! I am SAGE, your drive and storage assistant. How can I help you inspect or clean up files on your drives?")
             return finish(reply,allow_suggestions=False)
+        if not references:
+            named_target = LegacyAssistant._name_in(question)
+            if named_target and (re.search(r"\.[a-zA-Z0-9]{1,10}$", named_target) or re.search(r'["\'\x60]', question)):
+                found_target = None
+                if active_selection:
+                    candidate = os.path.join(active_selection[0], named_target)
+                    if "error" not in self.evidence.inspect(candidate):
+                        found_target = candidate
+                if not found_target:
+                    for item in self.evidence.resolve_name(named_target):
+                        if item.get("path") and "error" not in self.evidence.inspect(item["path"]):
+                            found_target = item["path"]
+                            break
+                if found_target:
+                    references = [found_target]
+                else:
+                    self.unresolved_paths = [named_target]
+                    self.tools.focus = []
+                    self.last_context = {'scanned_drive': self.result.volume.drive, 'unresolved_paths': list(self.unresolved_paths)}
+                    return finish(f"`{named_target}` does not exist on this drive.",allow_suggestions=False)
+            if not references:
+                references = self._find_named_targets(question, active_selection)
         if not references and self._is_off_topic(question):
-            return finish("I am SAGE, a storage and drive analysis assistant. I can only assist with inspecting files and folders, analyzing storage, and helping you safely clean up disk space. Please let me know how I can help with your drives or files.",allow_suggestions=False)
+            return finish("I am SAGE, a storage and drive analysis assistant. I can only assist with inspecting files and folders, analyzing storage, and helping you safely clean up disk space. Please let me know how I can help with your drives or files.", allow_suggestions=False)
         items=[]
         for path in (references or active_selection)[:4]:
             try:
@@ -540,6 +632,16 @@ class DriveAssistant:
                  'question_paths':references,'unresolved_paths':list(self.unresolved_paths),
                  'tree_selection':list(selected_paths[:4]),'selection_changed':selection_changed,
                  'policy':{'file_operations':'not available in chat; advice is allowed. This does not describe file permissions.','no_files_changed':True}}
+        for it in items:
+            if it.get('kind') == 'folder' and not it.get('is_reparse_point'):
+                summary = self.evidence.folder_summary(it['path'])
+                if summary and 'error' not in summary:
+                    context.setdefault('folder_summaries', []).append(summary)
+            it_path = it.get('path')
+            if it_path:
+                scoped = self.evidence.cleanup_candidates(it_path, limit=2)
+                context['has_cleanable_items_in_folder'] = bool(scoped.get('items'))
+                context['folder_risk'] = it.get('cleanup_risk', {}).get('risk', 'review')
         if items and self._is_cleanup_query(question):
             for it in items[:2]:
                 it_path = it.get('path')
@@ -602,24 +704,36 @@ class DriveAssistant:
             root_items=[self.evidence._entry(record) for record in largest]
             context['largest_direct_items']=[{key:row[key] for key in ('path','kind','allocated_display','child_names')} for row in root_items]
         self.last_context=context
-        if self.client.loading.is_set() and self.client.transport is None:
-            self.last_timings['status']='loading_fallback'
-            return finish(self._fallback(items,'Model is loading.'))
-        if not self.client.ready():
-            self.client.loading.set()
-            def warm():
+        if self.client.transport is None:
+            if self.client.loading.is_set():
+                if on_status: on_status('Loading AI model into memory...')
+                self.client.loading.wait(timeout=25)
+            if not self.client.ready():
+                if on_status: on_status('Loading AI model into memory...')
                 try:
                     self.client.warm([{'role':'system','content':self.system_prompt()}])
-                    if on_status:on_status('Local AI is ready for your next question.')
                 except RuntimeError:
-                    pass
-                finally:self.client.loading.clear()
-            threading.Thread(target=warm,daemon=True,name='sage-model-load').start()
-            self.last_timings['status']='loading_fallback'
-            return finish(self._fallback(items,'Model is loading.'))
+                    self.last_timings['status']='loading_fallback'
+                    return finish(self._fallback(items, 'Model is loading.', question=question))
+        else:
+            if self.client.loading.is_set():
+                self.last_timings['status']='loading_fallback'
+                return finish(self._fallback(items, 'Model is loading.', question=question))
+            if not self.client.ready():
+                self.client.loading.set()
+                def warm():
+                    try:
+                        self.client.warm([{'role':'system','content':self.system_prompt()}])
+                        if on_status:on_status('Local AI is ready for your next question.')
+                    except RuntimeError:
+                        pass
+                    finally:self.client.loading.clear()
+                threading.Thread(target=warm,daemon=True,name='sage-model-load').start()
+                self.last_timings['status']='loading_fallback'
+                return finish(self._fallback(items, 'Model is loading.', question=question))
         if time.monotonic()<self._backoff_until:
             self.last_timings['status']='backoff_fallback'
-            return finish(self._fallback(items,'Model is temporarily unavailable.'))
+            return finish(self._fallback(items, 'Model is temporarily unavailable.', question=question))
         messages=[{'role':'system','content':self.system_prompt()},
                   *[{'role':turn['role'],'content':turn['content'][:1200]} for turn in self.history[-6:]],
                   {'role':'user','content':question[:2000]+'\nDrive evidence: '+json.dumps(context,ensure_ascii=False)}]
@@ -817,4 +931,4 @@ class DriveAssistant:
             self.last_timings['status']='fallback'
             self.last_timings['error']=str(exc)
             if isinstance(exc,RuntimeError): self._backoff_until=time.monotonic()+20
-            return finish(self._fallback(last_items,str(exc)))
+            return finish(self._fallback(last_items, str(exc), question=question))

@@ -333,6 +333,7 @@ class ScanEvidence:
         "up", "may", "might", "shall", "will", "get", "got",
         "gb", "mb", "kb", "tb", "gig", "gigs", "gigabyte", "gigabytes", "megabyte", "megabytes", "byte", "bytes",
         "safety", "harm", "break", "broken", "work", "fine", "ok", "okay", "sure", "all",
+        "people", "person", "human", "bad", "black", "white", "great", "better", "best", "worst", "like", "actually", "know", "mean", "also", "just", "make", "think",
     })
 
     def _folder_index(self) -> dict[str, list[int]]:

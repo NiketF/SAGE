@@ -127,6 +127,17 @@ class OllamaClient:
         self._active_socket=connection
         if self._cancelled.is_set(): self.cancel()
 
+    def is_server_available(self) -> bool:
+        if self.transport is not None:
+            return True
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(OLLAMA_CHAT_URL.rsplit('/', 1)[0] + '/tags', timeout=1.0) as response:
+                data = json.loads(response.read(65536))
+            return any(model.get('name') == self.model for model in data.get('models', []))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+
     def ready(self):
         if self.transport is not None:return True
         try:
@@ -138,7 +149,7 @@ class OllamaClient:
 
     @staticmethod
     def _request(payload: dict, on_token: Callable[[str], None] | None = None, *, timeout_seconds: float | None = None, on_connection=None) -> dict:
-        budget = min(OLLAMA_TIMEOUT_SECONDS, timeout_seconds) if timeout_seconds is not None else OLLAMA_TIMEOUT_SECONDS
+        budget = timeout_seconds if timeout_seconds is not None else OLLAMA_TIMEOUT_SECONDS
         if budget <= 0:
             raise RuntimeError("The response time limit was reached.")
         deadline = time.monotonic() + budget
