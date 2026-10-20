@@ -495,5 +495,68 @@ class ConversationTests(unittest.TestCase):
         self.assertIn("Files: 2", answer)
 
 
+
+
+
+class RuntimePlacementTests(unittest.TestCase):
+    def test_loaded_model_still_needs_the_startup_runtime_profile(self):
+        def opened(*args,**kwargs):
+            return io.BytesIO(b'{"models":[{"name":"example"}]}')
+        with patch.dict(OllamaClient._gpu_layers,{},clear=True), \
+             patch('sage.services.local_ai.urllib.request.build_opener') as opener:
+            opener.return_value.open.side_effect=opened
+            client=OllamaClient(model='example')
+            self.assertFalse(client.ready())
+            OllamaClient._gpu_layers['example']=9
+            self.assertTrue(client.ready())
+
+    def test_startup_uses_model_metadata_and_reuses_placement_for_chat(self):
+        seen=[]
+        def opened(request,**kwargs):
+            data=json.loads(request.data);seen.append((request.full_url,data))
+            reply=({'model_info':{'general.architecture':'example','example.block_count':7}}
+                   if request.full_url.endswith('/show') else {'done':True})
+            return io.BytesIO(json.dumps(reply).encode())
+        with patch.dict(OllamaClient._gpu_layers,{},clear=True), \
+             patch('sage.services.local_ai.urllib.request.build_opener') as opener:
+            opener.return_value.open.side_effect=opened
+            client=OllamaClient(model='example');client.warm()
+            client.warm()  # No repeated model-info query or different runtime settings.
+            client.transport=lambda payload:seen.append(('chat',payload)) or {'message':{'content':'Hello'}}
+            client.chat([])
+            self.assertEqual(sum(url.endswith('/show') for url,_ in seen),1)
+            settings=[data['options'] for url,data in seen if not url.endswith('/show')]
+            self.assertTrue(all(options['num_gpu']==9 for options in settings))
+            self.assertTrue(all(options['num_ctx']==8192 and options['num_batch']==128 for options in settings))
+        self.assertFalse(OllamaClient.loading.is_set())
+
+    def test_unloadable_full_gpu_placement_falls_back_during_startup(self):
+        settings=[]
+        def opened(request,**kwargs):
+            data=json.loads(request.data)
+            if request.full_url.endswith('/show'):
+                return io.BytesIO(b'{"model_info":{"general.architecture":"example","example.block_count":7}}')
+            settings.append(data['options'])
+            if data['options']['num_gpu']!=-1:raise OSError('Not enough GPU memory')
+            return io.BytesIO(b'{"done":true}')
+        with patch.dict(OllamaClient._gpu_layers,{},clear=True), \
+             patch('sage.services.local_ai.urllib.request.build_opener') as opener:
+            opener.return_value.open.side_effect=opened
+            client=OllamaClient(model='example');client.warm()
+            self.assertEqual([options['num_gpu'] for options in settings],[9,-1])
+            self.assertEqual(client._runtime_options()['num_gpu'],-1)
+        self.assertFalse(OllamaClient.loading.is_set())
+
+    def test_failed_startup_clears_loading_state(self):
+        with patch.dict(OllamaClient._gpu_layers,{'example':9},clear=True), \
+             patch('sage.services.local_ai.urllib.request.build_opener') as opener:
+            opener.return_value.open.side_effect=OSError('Server unavailable')
+            with self.assertRaisesRegex(RuntimeError,'not ready'):OllamaClient(model='example').warm()
+        self.assertFalse(OllamaClient.loading.is_set())
+
+
+
+
+
 if __name__ == "__main__":
     unittest.main()

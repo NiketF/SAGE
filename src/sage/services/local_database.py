@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ntpath
+import json
 import os
 import sqlite3
 import time
@@ -96,6 +97,24 @@ class DriveIndex:
                 conn.execute('INSERT INTO content_fts(rowid,path,snippet) SELECT rowid,path,snippet FROM content_chunks')
                 conn.execute('PRAGMA user_version=2')
         self._ready = True
+
+    def record_fact(self, path, field, value, answer, *, source, scan_time=None):
+        """Persist and read back a measurement without blocking the file-index writer."""
+        # The index writes a scan in one transaction. A small SQLite sidecar keeps
+        # queried analytics independent of that writer; the existing index is unchanged.
+        path_db=Path(self.db_path)
+        conn=sqlite3.connect(str(path_db.with_name(path_db.stem+'-facts'+path_db.suffix)),timeout=.5)
+        try:
+            with conn:
+                conn.execute('CREATE TABLE IF NOT EXISTS facts (path TEXT COLLATE NOCASE, field TEXT, value_json TEXT, '
+                             'answer TEXT, source TEXT, scan_time TEXT, measured_at INTEGER, PRIMARY KEY(path,field))')
+                conn.execute('INSERT OR REPLACE INTO facts VALUES (?,?,?,?,?,?,?)',
+                             (path,field,json.dumps(value),answer,source,scan_time,int(time.time())))
+                row=conn.execute('SELECT value_json,answer,source,scan_time,measured_at FROM facts WHERE path=? AND field=?',
+                                 (path,field)).fetchone()
+            return {'path':path,'field':field,'value':json.loads(row[0]),'answer':row[1],
+                    'source':row[2],'scan_time':row[3],'measured_at':row[4]}
+        finally:conn.close()
 
     @staticmethod
     def _safe_for_content_index(path: str, extension: str, is_reparse: bool) -> bool:
@@ -397,7 +416,7 @@ class DriveIndex:
         self.ensure_schema()
         # instr avoids LIKE wildcard names and enforces folder boundaries.
         prefix = ntpath.normpath(scope).rstrip('\\').casefold() + '\\'
-        where, args = ['instr(casefold(path),?)=1'], [prefix]
+        where, args = ['instr(casefold(path),?)=1','casefold(path)<>?'], [prefix,ntpath.normpath(scope).casefold()]
         for clause, value in [('instr(casefold(name),?)>0',query.casefold()),
                               ('extension=?',extension.casefold())]:
             if value:

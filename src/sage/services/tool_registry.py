@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ntpath
+import os
+import sqlite3
 import time
 import re
 from datetime import datetime, timezone
@@ -14,7 +16,7 @@ from .evidence import format_bytes
 from .local_database import DriveIndex
 from .retrieval import ScanEvidence
 
-FACT_FIELDS=['size','logical_size','modified','files','folders','items','direct_files','direct_folders','direct_items']
+FACT_FIELDS=['size','logical_size','modified','files','folders','items','direct_files','direct_folders','direct_items','drive_capacity']
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,7 @@ class ToolRegistry:
     def __init__(self, evidence: ScanEvidence | None, index: DriveIndex | None) -> None:
         self.evidence = evidence
         self.index = index
+        self.analytics_index = index
         self.focus=[]
         self._cleanup_cache=None
 
@@ -89,6 +92,7 @@ class ToolRegistry:
     def definitions(self) -> list:
         """Small native tool descriptions; the model chooses meaning, code validates arguments."""
         fields = {'path':{'type':'string'},'scope':{'type':'string'},'query':{'type':'string'},
+                  'action':{'type':'string'},
                   'field':{'type':'string','enum':FACT_FIELDS},
                   'final':{'type':'boolean','description':'true ONLY if this fact fully answers the question; false if advice or explanation is also needed.'},
                   'limit':{'type':'integer','minimum':1,'maximum':20},
@@ -100,15 +104,16 @@ class ToolRegistry:
         fields.update({key:{'type':'integer'} for key in ('changed_within_days','unchanged_for_days')})
         fields.update({key:{'type':'string'} for key in ('after_date','before_date')})
         descriptions={
-            'report_fact':'Look up size/date/count. Set final=true ONLY for a pure fact question, never cleanup/impact advice. Omit path for one selected item. size=disk space; logical_size=data size; modified=last change; files/folders/items=recursive counts; direct_* counts=direct only.',
+            'report_fact':'Look up size/date/count or drive_capacity. Set final=true ONLY for a pure fact question, never cleanup/impact advice or a ranked-item question. Omit path for one selected item, or for drive_capacity. size=item disk space; logical_size=item data size; drive_capacity=LIVE whole-drive total/used/free/percent, not scanned file totals; modified=last change; counts recursive unless direct_*.',
             'inspect_path':'Inspect a verified item before advice: nested tree, file types, metadata, purpose clues and ownership evidence. Partial coverage never proves safety.',
-            'search_files':'Find files/folders by short name, type, size or dates. Dates: use day ranges or ISO after_date/before_date (YYYY-MM-DD, UTC), not timestamp arithmetic. Never use the whole question as query.',
+            'search_files':'Find local files/folders by short subject name, type, size or dates, including when nothing is selected. For rankings use kind=file/folder, sort=largest and the requested limit; never substitute scope totals. Dates use day ranges or ISO after_date/before_date (YYYY-MM-DD, UTC). Never use the whole question as query.',
+            'impact_analysis':'Add evidence about a verified item and a proposed action. References are clues, not verified runtime dependencies. System-volume items also include Windows-specific assessment.',
             'list_children':'List direct children of a folder. Use paths from the results for further inspection.',
             'drive_overview':'Get whole-drive counts and size totals.',
             'search_content':'Search approved local text excerpts. Missing results never prove no reference exists.',
             'find_references':'Find text that mentions a filename or identifier. Matches are clues, not verified runtime dependencies.',
             'find_duplicates':'Find possible duplicates by measured size. File contents are not compared.',
-            'cleanup_candidates':'Get existing cleanup rules and their conditions. No files are changed.'}
+            'cleanup_candidates':'Get existing cleanup rules and their conditions.'}
         return [{'type':'function','function':{'name':name,'description':description,
             'parameters':{'type':'object','properties':{key:fields[key] for key in (*self._SPECS[name].required,*self._SPECS[name].optional)},
                           'required':list(self._SPECS[name].required),'additionalProperties':False}}}
@@ -139,6 +144,17 @@ class ToolRegistry:
         arguments = dict(arguments)
         if name=='report_fact':
             if not self.evidence: return {'error':'No scan loaded.'}
+            if arguments['field']=='drive_capacity':
+                from ..platform.windows.drives import get_disk_space
+                drive=self.evidence.result.volume.drive
+                try:total,used,free=get_disk_space(drive)
+                except OSError:return {'error':'Windows could not read current capacity. An earlier measurement was not substituted.'}
+                if min(total,used,free)<0 or used+free!=total:raise ValueError('Invalid Windows volume measurement.')
+                percent=round(100*used/total,1) if total else None
+                percent_text=f'{percent:.1f}%' if percent is not None else 'percentage unavailable'
+                answer=f"{drive} capacity: {format_bytes(total)}. Used: {format_bytes(used)} ({percent_text}). Free: {format_bytes(free)}. Measured now by Windows."
+                return self._record_fact(drive+'\\','drive_capacity',{'total_bytes':total,'used_bytes':used,'free_bytes':free,'used_percent':percent},
+                                         answer,source='Windows volume measurement')
             if 'path' not in arguments:
                 if len(self.focus)!=1: return {'error':'Supply a verified path, or select one item.'}
                 arguments['path']=self.focus[0]
@@ -166,12 +182,19 @@ class ToolRegistry:
                 value=counts[{'items':0,'files':1,'folders':2}[field]]
                 answer=f'There are {value:,} {field} in `{path}` and its subfolders.'
                 if item['kind']=='file':answer=f'`{path}` is one file, so it has no contained files or folders.'
-            return {'path':path,'field':field,'value':value,'answer':answer}
+            if self.evidence.result.skipped_records and field in {'size','logical_size','files','folders','items'}:
+                answer+=' These totals cover retained scan records; some records were skipped.'
+            if item['kind']!='file' and self.evidence.result.size_errors and field in {'size','logical_size'}:
+                answer+=' Some sizes were unavailable, so this total can be lower than actual use.'
+            return self._record_fact(path,field,value,answer,source='Retained scan',scan_time=self.evidence.result.scanned_at.isoformat())
         if self.evidence and name not in {'inspect_path','list_children','summarize_folder','impact_analysis','drive_overview'}:
             arguments.setdefault('scope', self.evidence.result.volume.drive+'\\')
         if name == 'drive_overview':
             if not self.evidence: return {'error':'No scan loaded.'}
             overview=self.evidence.overview()
+            if self.analytics_index:
+                overview=self._record_fact(self.evidence.result.volume.drive+'\\','scan_overview',overview,'',
+                    source='Retained scan',scan_time=self.evidence.result.scanned_at.isoformat())['value']
             overview['allocated_display']=format_bytes(overview['allocated_bytes']) if overview['allocated_bytes'] is not None else 'pending'
             return overview
         if name == 'cleanup_candidates':
@@ -203,7 +226,9 @@ class ToolRegistry:
                             candidates[row['path']]=row
                     return {'items':[self._indexed_item(row) for row in list(candidates.values())[:8]],
                             'match_type':'related name candidates, not exact matches','instruction':'Inspect relevant candidates or ask the user to choose. Do not claim no files exist.'}
-                return {'items':[self._indexed_item(row) for row in rows]}
+                items=[self._indexed_item(row) for row in rows]
+                return {'items':items,'exact_paths':[row['path'] for row in items if row.get('path') and arguments.get('query') and
+                    ntpath.basename(row['path']).casefold()==arguments['query'].casefold()]}
             # ponytail: while indexing, inspect at most 20,000 records and report partial coverage.
             # A completed background index removes this temporary bound.
             matches=[]
@@ -212,6 +237,7 @@ class ToolRegistry:
                     break
                 path=self.evidence.result.path_for(record.frn)
                 if not path or not self.evidence.within(path,arguments['scope']): continue
+                if ntpath.normcase(ntpath.normpath(path))==ntpath.normcase(ntpath.normpath(arguments['scope'])):continue
                 if arguments.get('query','').casefold() not in record.name.casefold(): continue
                 if arguments.get('kind','any') != 'any' and record.is_directory != (arguments['kind']=='folder'): continue
                 if arguments.get('extension') and ntpath.splitext(record.name)[1].casefold()!=arguments['extension'].casefold(): continue
@@ -247,6 +273,8 @@ class ToolRegistry:
                         'folders':[r.name for r in children if r.is_directory][:6]})
                     parent=self.evidence.result.records[parent].parent_frn
                 if nearby:entry['parent_context']=nearby
+                assessment=self._windows_assessment(entry)
+                if assessment:entry['windows_assessment']=assessment
             return entry
 
         if name == "list_children":
@@ -316,10 +344,46 @@ class ToolRegistry:
 
         if name == "impact_analysis":
             if self.index:
-                return self.index.impact_analysis(arguments["path"], arguments["action"])
-            return {"path": arguments["path"], "action": arguments["action"], "read_only": True, "risk": "unknown"}
+                result=self.index.impact_analysis(arguments["path"], arguments["action"])
+            else:result={"path": arguments["path"], "action": arguments["action"], "read_only": True, "risk": "unknown"}
+            entry=self.call('inspect_path',{'path':arguments['path']})
+            if entry.get('windows_assessment'):result['windows_assessment']=entry['windows_assessment']
+            return result
 
         raise ValueError(f"Unsupported tool: {name}")
+
+    def _record_fact(self,path,field,value,answer,**metadata):
+        index=self.analytics_index or self.index
+        if index:
+            try:return index.record_fact(path,field,value,answer,**metadata)
+            except (OSError,sqlite3.Error) as exc:
+                return {'path':path,'field':field,'value':value,'answer':answer,**metadata,'persistence_error':str(exc)}
+        return {'path':path,'field':field,'value':value,'answer':answer}
+
+    def _windows_assessment(self,entry):
+        """Enrich existing evidence, without overriding benchmark's risk or policy."""
+        system_drive=os.environ.get('SystemDrive','C:').rstrip('\\')
+        if ntpath.splitdrive(entry['path'])[0].casefold()!=system_drive.casefold():return None
+        # Windows supplies these paths. Longest match distinguishes user app data
+        # from personal files; drive location alone is not a deletion verdict.
+        locations=[(os.environ.get(key),role,method) for key,role,method in (
+            ('SystemRoot','Windows-managed area','Windows servicing or Storage cleanup'),
+            ('ProgramFiles','Installed-application area','Application uninstaller or Installed apps'),
+            ('ProgramFiles(x86)','Installed-application area','Application uninstaller or Installed apps'),
+            ('ProgramData','Shared application data','Owning application settings; assess specific contents'),
+            ('USERPROFILE','User-profile area','Review the actual personal or application contents'),
+            ('APPDATA','User application data','Owning application settings; preserve needed state'),
+            ('LOCALAPPDATA','User application data','Owning application settings; preserve needed state'))]
+        matches=[row for row in locations if row[0] and self.evidence.within(entry['path'],row[0])]
+        match=max(matches,key=lambda row:len(row[0])) if matches else None
+        known=entry.get('known_location') or {}
+        return {'role':match[1] if match else 'Specific role not verified',
+                'basis':'Current Windows environment location' if match else 'No native-location match; inspect supplied contents and purpose clues',
+                'native_location':match[0] if match else None,
+                'supported_method':known.get('advice') or (match[2] if match else 'Establish the item role before a change recommendation'),
+                'registered_applications':entry.get('purpose_evidence',{}).get('installation_matches',[]),
+                'limits':'Location is not proof of active use, dependency, permissions or deletion safety. Application files are not automatically OS components.',
+                'documentation':'https://support.microsoft.com/en-us/windows/experience/storage-filemanagement/free-up-drive-space-in-windows'}
 
     def _indexed_item(self,row):
         # Recheck database hits against the active scan, not a previous scan's paths.

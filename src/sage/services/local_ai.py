@@ -107,6 +107,7 @@ CLEANUP_INTENT = re.compile(
 class OllamaClient:
     """Small standard-library client; never sends evidence to a cloud endpoint."""
     loading = threading.Event()
+    _gpu_layers = {}
 
     def __init__(self, model: str = MODEL_NAME, transport: Callable | None = None) -> None:
         self.model = model
@@ -133,7 +134,7 @@ class OllamaClient:
             opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
             with opener.open(OLLAMA_CHAT_URL.rsplit('/',1)[0]+'/ps',timeout=.25) as response:
                 data=json.loads(response.read(65536))
-            return any(model.get('name')==self.model for model in data.get('models',[]))
+            return self.model in self._gpu_layers and any(model.get('name')==self.model for model in data.get('models',[]))
         except (OSError,ValueError,TypeError,AttributeError):return False
 
     @staticmethod
@@ -219,7 +220,7 @@ class OllamaClient:
             "stream": True,
             "think": think,
             "keep_alive": "30m",
-            "options": {"num_ctx": 4096, "temperature": 0, "num_predict": min(max_tokens, 640)},
+            "options": {**self._runtime_options(), "temperature": 0, "num_predict": min(max_tokens, 640)},
         }
         if tools:
             payload["tools"] = tools
@@ -236,20 +237,40 @@ class OllamaClient:
             on_token(message["content"])
         return message
 
+    def _runtime_options(self):
+        return {'num_ctx':8192,'num_batch':128,'num_gpu':self._gpu_layers.get(self.model,-1)}
+
     def warm(self, messages=None, tools=None) -> None:
-        payload={"model":self.model,"stream":False,"keep_alive":"30m","options":{"num_ctx":4096,"num_predict":1}}
+        payload={"model":self.model,"stream":False,"keep_alive":"30m"}
         if messages:
             payload.update(messages=messages,tools=tools or [],think=False)
-        request = urllib.request.Request(OLLAMA_CHAT_URL if messages else OLLAMA_CHAT_URL.rsplit('/', 1)[0] + '/generate',
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"})
         self.loading.set()
         try:
-            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=60) as response:
-                data = json.loads(response.read(65536))
-            if not data.get("done") or data.get("error"):
-                raise RuntimeError("Local model could not finish loading.")
-        except (OSError, ValueError) as exc:
+            opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            if self.model not in self._gpu_layers:
+                try:
+                    request=urllib.request.Request(OLLAMA_CHAT_URL.rsplit('/',1)[0]+'/show',
+                        data=json.dumps({'model':self.model}).encode(),headers={'Content-Type':'application/json'})
+                    with opener.open(request,timeout=2) as response:info=json.load(response).get('model_info',{})
+                    blocks=info.get(str(info.get('general.architecture'))+'.block_count')
+                    if type(blocks) is int and blocks>0:self._gpu_layers[self.model]=blocks+2
+                except (OSError,ValueError,AttributeError):pass
+            # ponytail: try full text-model offload once during startup, with a small
+            # batch to fit limited VRAM. If it cannot load, keep Ollama's auto placement.
+            # This is a per-model process setting, never a retry during a user answer.
+            preferred=self._gpu_layers.get(self.model,-1)
+            for layers in ((preferred,-1) if preferred!=-1 else (-1,)):
+                self._gpu_layers[self.model]=layers
+                payload['options']={**self._runtime_options(),'num_predict':1}
+                request = urllib.request.Request(OLLAMA_CHAT_URL if messages else OLLAMA_CHAT_URL.rsplit('/', 1)[0] + '/generate',
+                    data=json.dumps(payload).encode(),headers={"Content-Type": "application/json"})
+                try:
+                    with opener.open(request, timeout=60) as response:data=json.loads(response.read(65536))
+                    if not data.get('done') or data.get('error'):raise RuntimeError('Local model could not finish loading.')
+                    break
+                except (OSError,ValueError,RuntimeError):
+                    if layers==-1:raise
+        except (OSError, ValueError, RuntimeError) as exc:
             raise RuntimeError("Local model is not ready. Scan facts remain available.") from exc
         finally:
             self.loading.clear()

@@ -280,7 +280,7 @@ class ConversationTests(unittest.TestCase):
                 self.assertEqual(tree['file_types'][0]['extension'],'.mp4')
                 self.assertFalse(tree['partial'])
                 self.assertEqual(a.last_timings['model_calls'],1)
-                self.assertEqual(reply.count('No file was changed.'),1)
+                self.assertNotIn('No file was changed',reply)
 
     def test_search_discovery_is_inspected_before_the_model_gives_advice(self):
         received=[]
@@ -403,7 +403,7 @@ class ConversationTests(unittest.TestCase):
         a=self.make_assistant(lambda _: tool('delete_path',{'path':r'E:\Media'}))
         reply=a.answer('Delete these files.',(r'E:\Media',))
         self.assertLessEqual(a.last_timings['model_calls'],3)
-        self.assertIn('No file was changed',reply)
+        self.assertNotIn('No file was changed',reply)
         self.assertEqual(a.last_suggestions,[])
 
     def test_unavailable_model_has_useful_fallback(self):
@@ -411,7 +411,7 @@ class ConversationTests(unittest.TestCase):
         a=self.make_assistant(unavailable)
         reply=a.answer('Help me decide.',(r'E:\Media',))
         self.assertIn('clip.mp4',reply)
-        self.assertIn('No file was changed',reply)
+        self.assertNotIn('No file was changed',reply)
         a.answer('Try again.',(r'E:\Media',))
         self.assertEqual(a.last_timings['model_calls'],0)
 
@@ -516,12 +516,12 @@ class ConversationTests(unittest.TestCase):
         reply=a.answer('Explain this.',(r'E:\Project\config.json',),on_token=tokens.append)
         self.assertEqual(''.join(tokens),reply)
 
-    def test_partial_generation_is_labelled_and_has_action_confirmation(self):
+    def test_partial_generation_is_not_presented_as_a_complete_explanation(self):
         a=self.make_assistant(lambda _: {'message':{'content':'This file may store project settings. Removing it could'},'done_reason':'length'})
         reply=a.answer('What happens if I remove it?',(r'E:\Project\config.json',))
-        self.assertIn('partial explanation',reply)
+        self.assertNotIn('partial explanation',reply)
         self.assertNotIn('Removing it could',reply)
-        self.assertIn('No file was changed',reply)
+        self.assertNotIn('No file was changed',reply)
 
     def test_c_drive_policy_is_separate_without_write_tools(self):
         a=self.make_assistant(lambda _: {'message':{'content':'This is an explanation.'}})
