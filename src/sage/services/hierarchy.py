@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 
-from ..config import FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_SPARSE_FILE
+from ..config import FILE_ATTRIBUTE_DIRECTORY
 from ..models import FileRecord, ScanResult, VolumeInfo
 
 NTFS_ROOT_FRN = 5
@@ -111,7 +111,8 @@ def calculate_directory_sizes(result: ScanResult) -> dict[int, tuple[int, int]]:
     totals: dict[int, tuple[int, int]] = {}
     for frn in _directory_postorder(result):
         logical = 0
-        allocated = 0
+        own = result.records[frn]
+        allocated = own.allocated_size if own.size_ready else 0  # Directory index/metadata streams.
         for child_frn in result.children.get(frn, ()):
             child = result.records.get(child_frn)
             if child is None:
@@ -122,8 +123,6 @@ def calculate_directory_sizes(result: ScanResult) -> dict[int, tuple[int, int]]:
                 allocated += child_allocated
             else:
                 child_logical = child.logical_size
-                if child.attributes & FILE_ATTRIBUTE_SPARSE_FILE:
-                    child_logical = min(child_logical, child.allocated_size)
                 logical += child_logical
                 allocated += child.allocated_size
         totals[frn] = (logical, allocated)

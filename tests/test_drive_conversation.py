@@ -280,7 +280,7 @@ class ConversationTests(unittest.TestCase):
                 self.assertEqual(tree['file_types'][0]['extension'],'.mp4')
                 self.assertFalse(tree['partial'])
                 self.assertEqual(a.last_timings['model_calls'],1)
-                self.assertEqual(reply.count('No file was changed.'),1)
+                self.assertNotIn('No file was changed',reply)
 
     def test_search_discovery_is_inspected_before_the_model_gives_advice(self):
         received=[]
@@ -403,17 +403,17 @@ class ConversationTests(unittest.TestCase):
         a=self.make_assistant(lambda _: tool('delete_path',{'path':r'E:\Media'}))
         reply=a.answer('Delete these files.',(r'E:\Media',))
         self.assertLessEqual(a.last_timings['model_calls'],3)
-        self.assertIn('No file was changed',reply)
+        self.assertNotIn('No file was changed',reply)
         self.assertEqual(a.last_suggestions,[])
 
     def test_unavailable_model_has_useful_fallback(self):
         def unavailable(_):raise RuntimeError('Model unavailable')
         a=self.make_assistant(unavailable)
         reply=a.answer('Help me decide.',(r'E:\Media',))
-        self.assertIn('clip.mp4',reply)
-        self.assertIn('No file was changed',reply)
+        self.assertNotIn('clip.mp4',reply)
+        self.assertNotIn('No file was changed',reply)
         a.answer('Try again.',(r'E:\Media',))
-        self.assertEqual(a.last_timings['model_calls'],0)
+        self.assertEqual(a.last_timings['model_calls'],1)
 
     def test_fallback_uses_short_simple_sentences_as_a_style_proxy(self):
         def unavailable(_):raise RuntimeError('Unavailable')
@@ -424,11 +424,12 @@ class ConversationTests(unittest.TestCase):
 
     def test_cold_model_loads_in_background_without_queuing_question(self):
         a=self.make_assistant(lambda _: {'message':{'content':'unused'}})
-        with patch.object(a.client,'ready',return_value=False),patch.object(a.client,'warm'),patch.object(a.client,'chat',side_effect=AssertionError('Do not queue')):
+        a.client.transport=None;a.client.loading.set()
+        with patch.object(a.client,'wait_for_warm',return_value=False),patch.object(a.client,'chat',side_effect=AssertionError('Startup did not finish')):
             started=time.monotonic()
             reply=a.answer('Help me decide.',(r'E:\Media',))
             self.assertLess(time.monotonic()-started,.2)
-        self.assertIn('clip.mp4',reply)
+        self.assertNotIn('clip.mp4',reply)
         self.assertEqual(a.last_timings['status'],'loading_fallback')
         a.client.loading.clear()
 
@@ -469,7 +470,7 @@ class ConversationTests(unittest.TestCase):
         a.client.transport=None
         tokens=[]
         def chat(messages,on_token,**kwargs):
-            first='{"answer":"Removing it may reset settings.",'
+            first='{"intent":"assessment","subject":null,"answer":"Removing it may reset settings.",'
             on_token(first)
             self.assertEqual(tokens,[])
             last='"purpose":"This JSON file stores settings."}'
@@ -521,7 +522,7 @@ class ConversationTests(unittest.TestCase):
         reply=a.answer('What happens if I remove it?',(r'E:\Project\config.json',))
         self.assertNotIn('partial explanation',reply)
         self.assertNotIn('Removing it could',reply)
-        self.assertIn('No file was changed',reply)
+        self.assertNotIn('No file was changed',reply)
 
     def test_c_drive_policy_is_separate_without_write_tools(self):
         a=self.make_assistant(lambda _: {'message':{'content':'This is an explanation.'}})

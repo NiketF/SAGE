@@ -90,9 +90,11 @@ class InstalledAppsDetectionTests(unittest.TestCase):
                 norm = str(path).casefold()
                 return "god of war" not in norm and "spider-man" not in norm
 
-            with patch("sage.services.conversation.installed_apps", return_value=mock_registry_apps), \
-                 patch("sage.services.conversation.os.path.exists", side_effect=mock_exists):
-                suggestions = assistant._detect_installed_apps(("D:\\Games",))
+            for app in mock_registry_apps:
+                app['registered_location']=app['location']
+            with patch("sage.services.profile.installed_apps",return_value=mock_registry_apps):
+                assistant.tools._optional_applications(r'D:\Games',20)
+                suggestions=list(assistant.tools._uninstall_actions.values())
 
             names = [s.title for s in suggestions]
             self.assertIn("Kingdom Come: Deliverance", names)

@@ -96,8 +96,8 @@ class SageApplication(tk.Tk):
             try:
                 OllamaClient().warm([{'role':'system','content':self._conversation.system_prompt()}])
                 status = "Ready for your question."
-            except RuntimeError:
-                status = "Local AI unavailable — basic scan answers still work"
+            except RuntimeError as exc:
+                status = f"Local AI unavailable: {exc}"
             self._events.put(("ai_ready", self._generation, status))
 
         threading.Thread(target=worker, daemon=True, name="sage-ai-warmup").start()
@@ -377,6 +377,8 @@ class SageApplication(tk.Tk):
                             self.assistant_panel.set_selected_item(new_target)
                 elif kind == "assistant_token":
                     self.assistant_panel.append_reply(event[3])
+                elif kind == "assistant_reset":
+                    self.assistant_panel.reset_reply()
                 elif kind == "assistant_status":
                     self.assistant_panel.set_status(event[3])
                 elif kind == "ai_ready":
@@ -495,6 +497,7 @@ class SageApplication(tk.Tk):
                     question, selected_paths, quoted=quoted,
                     on_token=lambda token: self._events.put(("assistant_token", generation, request_id, token)),
                     on_status=lambda status: self._events.put(("assistant_status", generation, request_id, status)),
+                    on_reset=lambda: self._events.put(("assistant_reset", generation, request_id)),
                 )
                 suggestions = list(conversation.last_suggestions)
                 links = list(conversation.last_links)
@@ -675,6 +678,10 @@ class SageApplication(tk.Tk):
         if result is None or self._file_operation_running:
             return
         if suggestion.action.startswith("uninstall:"):
+            current=self._conversation.uninstall_suggestions([suggestion.path])
+            if not any(item.path==suggestion.path and item.action==suggestion.action for item in current):
+                messagebox.showinfo(APP_NAME,"This uninstall suggestion could not be verified again. Ask SAGE for current application evidence.")
+                return
             uninstaller = suggestion.action[len("uninstall:"):].strip()
             prompt = (
                 f"Launch uninstaller for {suggestion.title}?\n\n"
@@ -683,7 +690,7 @@ class SageApplication(tk.Tk):
             )
             if messagebox.askyesno("Uninstall Application", prompt, parent=self):
                 try:
-                    subprocess.Popen(uninstaller, shell=True)
+                    subprocess.Popen(uninstaller, creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
                     self.assistant_panel.write("SAGE", f"Started uninstaller for {suggestion.title}. Rescan when done to see updated space.")
                 except Exception as exc:
                     messagebox.showerror(APP_NAME, f"Could not launch uninstaller:\n{exc}")

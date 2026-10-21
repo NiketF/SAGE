@@ -86,34 +86,17 @@ class ScanEvidence:
         now = time.monotonic()
         if self._applications and now - self._applications[0] < 60:
             return self._applications[1]
-        apps = []
-        try:
-            import winreg
-            deadline = now + 0.04
-            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-                for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
-                    try:
-                        with winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", 0, winreg.KEY_READ | view) as root:
-                            for index in range(winreg.QueryInfoKey(root)[0]):
-                                if time.monotonic() >= deadline:
-                                    break
-                                try:
-                                    with winreg.OpenKey(root, winreg.EnumKey(root, index)) as key:
-                                        name = winreg.QueryValueEx(key, "DisplayName")[0]
-                                        location = winreg.QueryValueEx(key, "InstallLocation")[0]
-                                        if isinstance(name, str) and isinstance(location, str) and ntpath.isabs(location) and ntpath.dirname(ntpath.normpath(location)) != ntpath.normpath(location):
-                                            norm_loc = ntpath.normpath(location)
-                                            if os.path.exists(norm_loc):
-                                                apps.append({"name": name[:100], "location": norm_loc})
-                                except OSError:
-                                    continue
-                    except OSError:
-                        continue
-        except ImportError:
-            pass
-        # ponytail: a 40 ms inventory budget can yield partial records. Missing
-        # matches stay unknown; use on-demand app-specific lookup if needed later.
-        self._applications = (now, apps)
+        from .profile import installed_apps
+        apps=[]
+        for app in installed_apps(seconds=.04):
+            location=app.get('registered_location') or app.get('location')
+            if not isinstance(location,str) or not ntpath.isabs(location):continue
+            parts=ntpath.normpath(location).rstrip('\\').split('\\')
+            if len(parts)<2 or len(parts)==2 and parts[1].casefold() in {'windows','users','program files','program files (x86)','programdata'}:continue
+            apps.append({**app,'location':ntpath.normpath(location),
+                         'location_verified':bool(app.get('registered_location')),
+                         'uninstall_available':bool(app.get('uninstall_string'))})
+        self._applications=(now,apps)
         return apps
 
     def _read_excerpt(self, record: FileRecord, limit: int = 2048) -> dict:
@@ -271,7 +254,12 @@ class ScanEvidence:
                     "coverage": f"Sampled {min(len(children), 128)} of {len(children)} direct children.",
                     "role": "Unresolved", "basis": "Scan metadata", "contents_read": False,
                     "dependencies_verified": False, "owner_verified": False}
-        matches = [app for app in self._installed_applications() if self.within(path, app["location"])]
+        applications=self._installed_applications()
+        matches = [{key:value for key,value in app.items() if key!='uninstall_string'}
+                   for app in applications if app.get('location_verified') and self.within(path,app['location'])]
+        evidence['installation_candidates']=[{'name':app['name'],'location':app['location'],
+            'basis':app.get('location_basis','Inferred location'),'owner_verified':False}
+            for app in applications if not app.get('location_verified') and self.within(path,app['location'])][:2]
         evidence["installation_matches"] = sorted(matches, key=lambda app: len(app["location"]), reverse=True)[:2]
         evidence["inventory_coverage"] = "Partial local installation records; no match does not establish an orphan."
         if record.is_directory:
@@ -533,6 +521,10 @@ class ScanEvidence:
             "logical_display": format_bytes(logical) if ready else "pending",
             "allocated_display": format_bytes(allocated) if ready else "pending",
             "size_error": record.size_error,
+            **({'shared_storage': {'primary_path': result.path_for(record.hardlink_to or record.frn),
+                'link_count': record.link_count, 'allocation_counted_here': record.hardlink_to is None,
+                'limits': 'Storage is attributed once across hard links. Removing one path may free no data; zero attributed allocation does not mean empty.'}}
+               if record.link_count > 1 else {}),
             "cleanup_risk": assess_path(path or ""),
             "role_basis": "Path/attribute heuristic",
             "owner_verified": False,

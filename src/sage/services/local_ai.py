@@ -7,9 +7,13 @@ import ntpath
 import re
 import time
 import socket
+import os
+import shutil
+import subprocess
 import threading
 import urllib.error
 import urllib.request
+import urllib.parse
 from collections.abc import Callable
 
 from ..models import ScanResult
@@ -35,7 +39,8 @@ def settings_links(reply: str) -> list[dict[str, str]]:
 
 MODEL_NAME = "qwen3.5:4b"
 OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"
-OLLAMA_TIMEOUT_SECONDS = 30
+OLLAMA_TIMEOUT_SECONDS = 30  # Connection/read inactivity, not healthy-stream duration.
+OLLAMA_RESPONSE_TIMEOUT_SECONDS = 120  # Safety ceiling; never a response-time target.
 MODEL_TARGET_SECONDS = 15
 
 SYSTEM_INSTRUCTIONS = (
@@ -107,6 +112,26 @@ CLEANUP_INTENT = re.compile(
 class OllamaClient:
     """Small standard-library client; never sends evidence to a cloud endpoint."""
     loading = threading.Event()
+    _start_lock = threading.Lock()
+    _server_process = None
+    _gpu_layers = {}
+    _warm_lock = threading.Lock()
+    _warm_complete = threading.Event()
+    _warm_complete.set()
+
+    def wait_for_warm(self,timeout):
+        deadline=time.monotonic()+timeout
+        while not self._warm_complete.is_set():
+            if self._cancelled.is_set():raise RuntimeError('The scan conversation was cancelled.')
+            remaining=deadline-time.monotonic()
+            if remaining<=0:return False
+            self._warm_complete.wait(min(.1,remaining))
+        return True
+
+    def _runtime_options(self):
+        # Small prefill batches leave more VRAM for model layers. Use the same
+        # placement/context for warm-up and chat to avoid runner reloads.
+        return {'num_ctx':8192,'num_batch':128,'num_gpu':self._gpu_layers.get(self.model,-1)}
 
     def __init__(self, model: str = MODEL_NAME, transport: Callable | None = None) -> None:
         self.model = model
@@ -136,9 +161,37 @@ class OllamaClient:
             return any(model.get('name')==self.model for model in data.get('models',[]))
         except (OSError,ValueError,TypeError,AttributeError):return False
 
+    @classmethod
+    def _ensure_server(cls):
+        """Start the installed local runtime once; never install or download it."""
+        endpoint=urllib.parse.urlsplit(OLLAMA_CHAT_URL)
+        if endpoint.hostname not in {'localhost','127.0.0.1','::1'}:return
+        def listening():
+            try:
+                with socket.create_connection((endpoint.hostname,endpoint.port or 11434),timeout=.25):return True
+            except OSError:return False
+        with cls._start_lock:
+            if listening():return
+            if cls._server_process is None or cls._server_process.poll() is not None:
+                executable=shutil.which('ollama')
+                if not executable:
+                    candidate=ntpath.join(os.environ.get('LOCALAPPDATA',''),'Programs','Ollama','ollama.exe')
+                    if os.path.isfile(candidate):executable=candidate
+                if not executable:raise RuntimeError('Ollama was not found. Install it or make its executable available to SAGE.')
+                cls._server_process=subprocess.Popen([executable,'serve'],stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+            # Startup runs in the existing background worker, outside question time.
+            deadline=time.monotonic()+5
+            while time.monotonic()<deadline:
+                if listening():return
+                if cls._server_process.poll() is not None:break
+                time.sleep(.1)
+            raise RuntimeError('The installed Ollama runtime did not become available. Check its startup before asking again.')
+
     @staticmethod
     def _request(payload: dict, on_token: Callable[[str], None] | None = None, *, timeout_seconds: float | None = None, on_connection=None) -> dict:
-        budget = min(OLLAMA_TIMEOUT_SECONDS, timeout_seconds) if timeout_seconds is not None else OLLAMA_TIMEOUT_SECONDS
+        budget = timeout_seconds if timeout_seconds is not None else OLLAMA_RESPONSE_TIMEOUT_SECONDS
         if budget <= 0:
             raise RuntimeError("The response time limit was reached.")
         deadline = time.monotonic() + budget
@@ -151,7 +204,7 @@ class OllamaClient:
         )
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(request, timeout=budget) as response:
+            with opener.open(request, timeout=min(OLLAMA_TIMEOUT_SECONDS, budget)) as response:
                 connection = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
                 if on_connection: on_connection(connection)
                 def cancel():
@@ -198,11 +251,9 @@ class OllamaClient:
                     raise TimeoutError()
                 raise RuntimeError("Local Ollama ended its response before completion.")
         except TimeoutError as exc:
-            raise RuntimeError(
-                f"Local Ollama did not finish within {OLLAMA_TIMEOUT_SECONDS} seconds. "
-                "The model may still be loading or generating a reply. "
-                "This does not mean Ollama is disconnected."
-            ) from exc
+            reason = ("The local AI response time limit was reached." if expired.is_set() or time.monotonic() >= deadline
+                      else f"Local Ollama stopped responding for {min(OLLAMA_TIMEOUT_SECONDS, budget):g} seconds.")
+            raise RuntimeError(reason) from exc
         except (OSError, ValueError, urllib.error.URLError) as exc:
             if expired.is_set() or time.monotonic() >= deadline:
                 raise RuntimeError("The local AI response time limit was reached.") from exc
@@ -219,7 +270,7 @@ class OllamaClient:
             "stream": True,
             "think": think,
             "keep_alive": "30m",
-            "options": {"num_ctx": 4096, "temperature": 0, "num_predict": min(max_tokens, 640)},
+            "options": {**self._runtime_options(), "temperature": 0, "num_predict": min(max_tokens, 640)},
         }
         if tools:
             payload["tools"] = tools
@@ -237,22 +288,45 @@ class OllamaClient:
         return message
 
     def warm(self, messages=None, tools=None) -> None:
-        payload={"model":self.model,"stream":False,"keep_alive":"30m","options":{"num_ctx":4096,"num_predict":1}}
+        if not self._warm_lock.acquire(blocking=False):
+            if not self.wait_for_warm(60):raise RuntimeError('Local AI startup is still in progress.')
+            return
+        self._warm_complete.clear()
+        self.loading.set()
+        payload={"model":self.model,"stream":False,"keep_alive":"30m"}
         if messages:
             payload.update(messages=messages,tools=tools or [],think=False)
-        request = urllib.request.Request(OLLAMA_CHAT_URL if messages else OLLAMA_CHAT_URL.rsplit('/', 1)[0] + '/generate',
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"})
-        self.loading.set()
         try:
-            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=60) as response:
-                data = json.loads(response.read(65536))
-            if not data.get("done") or data.get("error"):
-                raise RuntimeError("Local model could not finish loading.")
+            self._ensure_server()
+            opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            if self.model not in self._gpu_layers:
+                try:
+                    request=urllib.request.Request(OLLAMA_CHAT_URL.rsplit('/',1)[0]+'/show',
+                        data=json.dumps({'model':self.model}).encode(),headers={'Content-Type':'application/json'})
+                    with opener.open(request,timeout=2) as response:info=json.load(response).get('model_info',{})
+                    blocks=info.get(str(info.get('general.architecture'))+'.block_count')
+                    if type(blocks) is int and blocks>0:self._gpu_layers[self.model]=blocks+2
+                except (OSError,ValueError,AttributeError):pass
+            preferred=self._gpu_layers.get(self.model,-1)
+            # ponytail: try full text-model placement once at startup, then let
+            # Ollama choose placement if the installed hardware cannot load it.
+            for layers in ((preferred,-1) if preferred!=-1 else (-1,)):
+                self._gpu_layers[self.model]=layers
+                payload['options']={**self._runtime_options(),'num_predict':1}
+                request=urllib.request.Request(OLLAMA_CHAT_URL if messages else OLLAMA_CHAT_URL.rsplit('/',1)[0]+'/generate',
+                    data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
+                try:
+                    with opener.open(request,timeout=60) as response:data=json.loads(response.read(65536))
+                    if not data.get('done') or data.get('error'):raise RuntimeError('Local model could not finish loading.')
+                    break
+                except (OSError,ValueError,RuntimeError):
+                    if layers==-1:raise
         except (OSError, ValueError) as exc:
             raise RuntimeError("Local model is not ready. Scan facts remain available.") from exc
         finally:
             self.loading.clear()
+            self._warm_complete.set()
+            self._warm_lock.release()
 
 
 class ConversationAssistant:

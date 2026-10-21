@@ -43,13 +43,11 @@ class ConversationalIntentTests(unittest.TestCase):
             'Documents/report.docx': 20000,
         }, drive='D:')
         self.transport_calls = []
+        self.model_reply={'subject':None,'purpose':'This item needs review.','answer':'Check its use before removal.'}
 
         def transport(payload):
             self.transport_calls.append(payload)
-            return {'message': {'content': json.dumps({
-                'purpose': 'Game files for Kingdom Come.',
-                'answer': 'This application can be uninstalled safely if no longer played.'
-            })}}
+            return {'message': {'content': json.dumps(self.model_reply)}}
 
         self.client = OllamaClient(transport=transport)
         self.index = DriveIndex(str(Path(self.temp.name) / 'index.sqlite3'))
@@ -59,14 +57,16 @@ class ConversationalIntentTests(unittest.TestCase):
         greetings = ['hi', 'hii', 'hello SAGE', 'good morning', 'hey there']
         for g in greetings:
             with self.subTest(greeting=g):
+                self.transport_calls.clear()
+                self.model_reply={'subject':None,'purpose':'Hello!','answer':'How can I help with your storage?'}
                 reply = self.assistant.answer(g, (r'D:\Games',))
-                self.assertIn('Hello! I am SAGE', reply)
-                self.assertIn('drive D:', reply)
+                self.assertIn('Hello!', reply)
+                self.assertNotIn('Game files',reply)
                 # Must not recite folder data
                 self.assertNotIn('game.exe', reply)
                 self.assertNotIn('photo.jpg', reply)
                 # Model was not called for pure greeting
-                self.assertEqual(len(self.transport_calls), 0)
+                self.assertEqual(len(self.transport_calls), 1)
                 # No uninstall suggestions attached
                 self.assertEqual(self.assistant.last_suggestions, [])
 
@@ -80,41 +80,52 @@ class ConversationalIntentTests(unittest.TestCase):
         for query in off_topic_queries:
             with self.subTest(query=query):
                 self.transport_calls.clear()
+                self.model_reply={'subject':None,'purpose':'I help with computing and storage.','answer':'Ask me about your files or drives.'}
                 reply = self.assistant.answer(query, (r'D:\Games',))
-                self.assertIn('storage and drive analysis assistant', reply)
+                self.assertIn('computing and storage', reply)
                 self.assertNotIn('game.exe', reply)
                 self.assertNotIn('Games folder contains', reply)
-                self.assertEqual(len(self.transport_calls), 0)
+                self.assertEqual(len(self.transport_calls), 1)
                 self.assertEqual(self.assistant.last_suggestions, [])
 
     def test_non_existent_explicit_path_cleanly_reported(self):
         reply = self.assistant.answer(r'Can I delete D:\DoesNotExist\file.txt?', (r'D:\Games',))
-        self.assertIn(r'`D:\DoesNotExist\file.txt` does not exist on this drive.', reply)
+        self.assertIn('not verified in this scan',reply)
         # Must not fall back to describing D:\Games
         self.assertNotIn('Kingdom Come', reply)
         self.assertEqual(self.assistant.last_suggestions, [])
 
     def test_non_existent_named_file_cleanly_reported(self):
-        reply = self.assistant.answer('Can I delete fake_document.pdf?', (r'D:\Games',))
-        self.assertIn('`fake_document.pdf` does not exist on this drive.', reply)
-        self.assertNotIn('Kingdom Come', reply)
-        self.assertEqual(self.assistant.last_suggestions, [])
+        self.model_reply={'subject':None,'purpose':'No verified match was returned for fake_document.pdf.',
+                          'answer':'The retained scan cannot establish whether an unscanned copy exists.'}
+        calls=[]
+        def respond(payload):
+            calls.append(payload)
+            reply={'subject':'fake_document.pdf','calls':[{'name':'search_files','args':{'query':'fake_document.pdf'}}]} if len(calls)==1 else self.model_reply
+            return {'message':{'content':json.dumps(reply)}}
+        self.client.transport=respond
+        reply=self.assistant.answer('Can I delete fake_document.pdf?',(r'D:\Games',))
+        self.assertIn('No verified match',reply)
+        self.assertNotIn('Kingdom Come',reply)
+        self.assertEqual(self.assistant.last_suggestions,[])
+        self.assertTrue(any(row['name']=='search_files' and not row['result'].get('items') for row in self.assistant.last_context['lookups']))
 
     def test_existing_named_file_in_selected_folder_is_inspected(self):
+        self.model_reply={'subject':'photo.jpg','purpose':'This is an image file.','answer':'Review whether you need it.'}
         reply = self.assistant.answer('Can I delete photo.jpg?', (r'D:\Games',))
         self.assertNotIn('does not exist', reply)
         self.assertEqual(self.assistant.focus, [r'D:\Games\photo.jpg'])
 
     def test_suggestions_not_attached_on_pure_fact_queries(self):
         # User asking about size or content without cleanup intent
-        with patch.object(self.assistant, '_detect_installed_apps', return_value=[{'dummy': 1}]):
-            self.assistant.answer('How big is this folder?', (r'D:\Games',))
-            self.assertEqual(self.assistant.last_suggestions, [])
+        self.model_reply={'subject':r'D:\Games','fact':'size'}
+        self.assistant.answer('How big is this folder?',(r'D:\Games',))
+        self.assertEqual(self.assistant.last_suggestions,[])
 
-    def test_suggestions_attached_on_cleanup_queries(self):
-        with patch.object(self.assistant, '_detect_installed_apps', return_value=['suggestion']):
-            self.assistant.answer('what can i delete here?', (r'D:\Games',))
-            self.assertEqual(self.assistant.last_suggestions, ['suggestion'])
+    def test_suggestions_require_an_explicit_model_action(self):
+        self.model_reply={'subject':r'D:\Games','purpose':'This holds games.','answer':'Review what you still play.'}
+        self.assistant.answer('What can I delete here?',(r'D:\Games',))
+        self.assertEqual(self.assistant.last_suggestions,[])
 
     def test_asking_about_outside_folder_overrides_selection(self):
         c_scan = make_scan({
@@ -126,15 +137,18 @@ class ConversationalIntentTests(unittest.TestCase):
         assistant = DriveAssistant(c_scan, self.client, self.index)
 
         # 1. Active selection is ProgramData, but user asks about Program Files
+        self.model_reply={'subject':r'C:\Program Files','purpose':'This holds applications.','answer':'Use their uninstallers if no longer needed.'}
         assistant.answer('can i delete program files?', (r'C:\ProgramData',))
         self.assertEqual(assistant.focus, [r'C:\Program Files'])
 
         # 2. Active selection is Program Files, user asks about Fraps
+        self.model_reply={'subject':r'C:\Fraps','purpose':'This holds an executable.','answer':'Its active use is not verified.'}
         reply = assistant.answer('what is inside Fraps?', (r'C:\Program Files',))
         self.assertEqual(assistant.focus, [r'C:\Fraps'])
         self.assertNotIn('storage and drive analysis assistant', reply)
 
         # 3. Active selection is Fraps, user asks about Games
+        self.model_reply={'subject':r'C:\Games','purpose':'This holds game files.','answer':'Review whether you still need them.'}
         reply = assistant.answer('what is inside games can i delete it?', (r'C:\Fraps',))
         self.assertEqual(assistant.focus, [r'C:\Games'])
         self.assertNotIn('Program Files', reply)
@@ -146,15 +160,10 @@ class ConversationalIntentTests(unittest.TestCase):
         }, drive='C:')
         assistant = DriveAssistant(c_scan, self.client, self.index)
 
-        def mock_detect(targets):
-            if any('Program Files' in t for t in targets):
-                return ['app_in_program_files']
-            return []
-
-        with patch.object(assistant, '_detect_installed_apps', side_effect=mock_detect):
-            assistant.answer('can i delete perflogs', (r'C:\Program Files (x86)',))
-            self.assertEqual(assistant.focus, [r'C:\PerfLogs'])
-            self.assertEqual(assistant.last_suggestions, [])
+        self.model_reply={'subject':r'C:\PerfLogs','purpose':'This contains logs.','answer':'Check whether you need the records.'}
+        assistant.answer('can i delete perflogs',(r'C:\Program Files (x86)',))
+        self.assertEqual(assistant.focus,[r'C:\PerfLogs'])
+        self.assertEqual(assistant.last_suggestions,[])
 
     def test_size_number_tokens_do_not_match_git_object_folders(self):
         """'50 gb' must not pick up .git/objects/50 as the target."""
@@ -195,12 +204,12 @@ class ConversationalIntentTests(unittest.TestCase):
         assistant.answer('what can i delete here?', (r'D:\Games\Kingdom Come',))
         ctx = assistant.last_context
         # Context should have largest_items_in_folder to help the model make recommendations
-        self.assertIn('largest_items_in_folder', ctx,
-                      msg="cleanup query should populate largest_items_in_folder in context")
-        # The largest items should reflect actual children
-        paths_in_ctx = [item['path'] for item in ctx['largest_items_in_folder']]
-        self.assertTrue(any('cache' in p.lower() or 'game' in p.lower() for p in paths_in_ctx),
-                        msg=f"Expected game/cache sub-items in context, got: {paths_in_ctx}")
+        item=ctx['selected_items'][0]
+        self.assertIn('largest_direct_children',item)
+        self.assertIn('cleanup_options',item)
+        paths_in_ctx=[child['path'] for child in item['largest_direct_children']]
+        self.assertTrue(any('cache' in path.lower() or 'game' in path.lower() for path in paths_in_ctx))
+
 
 
 if __name__ == '__main__':

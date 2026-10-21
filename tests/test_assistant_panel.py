@@ -23,6 +23,18 @@ class MarkdownTests(unittest.TestCase):
 
 
 class AssistantPanelTests(unittest.TestCase):
+    def test_replacement_resets_only_current_reply_and_keeps_generation_active(self):
+        self.panel.begin_reply()
+        self.panel.append_reply('Rejected generation.')
+        self.panel._render_reply()
+        self.panel.reset_reply()
+        self.assertNotIn('Rejected generation',self.panel.transcript.get('1.0','end'))
+        self.assertTrue(self.panel._busy)
+        self.assertIsNotNone(self.panel._reply_mark)
+        self.panel.append_reply('Complete replacement.')
+        self.panel.finish_reply('Complete replacement.')
+        self.assertEqual(self.panel.transcript.get('1.0','end').count('Complete replacement.'),1)
+
     def setUp(self):
         try:
             self.root = tk.Tk()

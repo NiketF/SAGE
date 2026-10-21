@@ -1,6 +1,6 @@
 """Enumerate NTFS records by sequentially reading $MFT, like WizTree.
 
-Sizes come from each record's unnamed $DATA, so a second directory-walk size
+Sizes and hard-link names come from MFT attributes, so a second directory-walk size
 pass is unnecessary. There is no os.walk() fallback: a failed native scan stays
 visible.
 """
@@ -15,7 +15,6 @@ from ctypes import wintypes
 
 from ...config import (
     FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_SPARSE_FILE,
     MFT_BUFFER_SIZE,
     MFT_PROGRESS_INTERVAL,
 )
@@ -128,6 +127,7 @@ def parse_data_runs(data: bytes) -> list[tuple[int, int]]:
 
 def parse_mft_file_record(
     record: bytes | bytearray | memoryview,
+    details: dict | None = None,
 ) -> tuple[int, int, bool, str, int, int, int, int, int] | None:
     """Return (base_ref, sequence, is_directory, name, parent_frn, logical, allocated, modified, attributes).
 
@@ -152,6 +152,9 @@ def parse_mft_file_record(
     modified = 0
     attributes = 0
     reparse_tag = None
+    names = []
+    streams = {}
+    has_attribute_list = False
     offset = first_attr
     while offset + 16 <= limit:
         attr_type = struct.unpack_from("<I", record, offset)[0]
@@ -159,7 +162,7 @@ def parse_mft_file_record(
             break
         attr_len = struct.unpack_from("<I", record, offset + 4)[0]
         if attr_len < 16 or offset + attr_len > limit:
-            break
+            return None
         non_resident = record[offset + 8]
         name_len = record[offset + 9]
         if attr_type in (ATTR_STANDARD_INFORMATION, ATTR_REPARSE_POINT) and not non_resident:
@@ -171,21 +174,37 @@ def parse_mft_file_record(
                 attributes = struct.unpack_from("<I", record, value_start + 0x20)[0]
             elif attr_type == ATTR_REPARSE_POINT and value_len >= 4 and value_start + 4 <= limit:
                 reparse_tag = struct.unpack_from("<I", record, value_start)[0]
+        elif attr_type == 0x20:
+            has_attribute_list = True
+            if non_resident:
+                sizes = _unnamed_data_sizes(record, offset, non_resident)
+                if sizes is not None:
+                    streams[(attr_type, b'')] = sizes
         elif attr_type == ATTR_FILE_NAME and not non_resident:
             parsed = _file_name_attr(record, offset)
             if parsed is not None:
                 candidate, parent, rank = parsed
+                if rank > 0 and (parent, candidate) not in names:
+                    names.append((parent, candidate))  # Exclude DOS aliases, retain Win32/POSIX links.
                 if rank > name_rank:
                     name, parent_frn, name_rank = candidate, parent, rank
-        elif attr_type == ATTR_DATA and name_len == 0:
+        elif attr_type == ATTR_DATA or non_resident:
+            # Attribute sizes are valid only in the first extent. Include named
+            # data (e.g. WOF backing streams) and nonresident directory metadata.
+            name_off = struct.unpack_from("<H", record, offset + 0x0A)[0]
+            if name_len and (name_off < 16 or name_off + name_len * 2 > attr_len):
+                return None
+            stream_name = bytes(record[offset + name_off:offset + name_off + name_len * 2]) if name_len else b""
             sizes = _unnamed_data_sizes(record, offset, non_resident)
             if sizes is not None:
-                logical, allocated = sizes
+                streams[(attr_type, stream_name)] = sizes
         offset += attr_len
     if reparse_tag is not None and not reparse_tag & REPARSE_TAG_NAME_SURROGATE:
         attributes &= ~FILE_ATTRIBUTE_REPARSE_POINT
-    if attributes & FILE_ATTRIBUTE_SPARSE_FILE:
-        logical = min(logical, allocated)
+    logical = streams.get((ATTR_DATA, b""), (0, 0))[0]
+    allocated = sum(size[1] for size in streams.values())
+    if details is not None:
+        details.update(names=names, streams=streams, attribute_list=has_attribute_list)
     return (base_ref, sequence, is_directory, name, parent_frn, logical, allocated, modified, attributes)
 
 
@@ -210,23 +229,24 @@ def _file_name_attr(record: bytes | bytearray | memoryview, offset: int) -> tupl
 def _unnamed_data_sizes(
     record: bytes | bytearray | memoryview, offset: int, non_resident: int
 ) -> tuple[int, int] | None:
+    attr_end = min(len(record), offset + struct.unpack_from("<I", record, offset + 4)[0])
     if non_resident:
-        if offset + 0x40 > len(record):
+        if offset + 0x40 > attr_end:
             return None
         lowest_vcn = struct.unpack_from("<q", record, offset + 0x10)[0]
         if lowest_vcn != 0:
             return None
         flags = struct.unpack_from("<H", record, offset + 0x0C)[0]
         if flags & (ATTR_FLAG_COMPRESSED | ATTR_FLAG_SPARSE):
-            if offset + 0x48 > len(record):
+            if offset + 0x48 > attr_end:
                 return None
             allocated = max(0, struct.unpack_from("<q", record, offset + 0x40)[0])
         else:
             allocated = max(0, struct.unpack_from("<q", record, offset + 0x28)[0])
         logical = max(0, struct.unpack_from("<q", record, offset + 0x30)[0])
-        if flags & ATTR_FLAG_SPARSE:
-            logical = min(logical, allocated)
         return logical, allocated
+    if offset + 0x18 > attr_end:
+        return None
     value_len = struct.unpack_from("<I", record, offset + 0x10)[0]
     return max(0, value_len), 0
 
@@ -393,7 +413,8 @@ def enumerate_mft(
     records: dict[int, FileRecord] = {}
     skipped = 0
     last_reported = 0
-    extension_sizes: dict[int, tuple[int, int]] = {}
+    record_details: dict[int, dict] = {}
+    extensions: dict[int, dict] = {}
     progress_details = getattr(progress, "on_details", None)
 
     try:
@@ -412,6 +433,8 @@ def enumerate_mft(
         if len(first) < record_size:
             raise OSError("Could not read $MFT record 0.")
         runs = _mft_data_runs(bytearray(first))
+        if sum(count for _lcn, count in runs) * cluster < valid:
+            raise OSError("$MFT requires additional mapping records; refusing an incomplete scan.")
         if progress:
             progress(0)
         if progress_details:
@@ -429,21 +452,26 @@ def enumerate_mft(
             rec_off = 0
             while rec_off < usable:
                 if pending[rec_off : rec_off + 4] == b"FILE":
+                    in_use = struct.unpack_from("<H", pending, rec_off + 0x16)[0] & MFT_IN_USE
+                    if not in_use:
+                        record_index += 1
+                        rec_off += record_size
+                        continue
                     if apply_mft_fixup(pending, rec_off, record_size):
+                        details = {}
                         parsed = parse_mft_file_record(
-                            memoryview(pending)[rec_off : rec_off + record_size]
+                            memoryview(pending)[rec_off : rec_off + record_size], details
                         )
                         if parsed is not None:
                             base_ref, sequence, is_directory, name, parent_frn, logical, allocated, modified, file_attributes = parsed
                             frn = (record_index & NTFS_RECORD_NUMBER_MASK) | (sequence << 48)
                             if base_ref:
-                                if logical or allocated:
-                                    extension_sizes[base_ref & NTFS_RECORD_NUMBER_MASK] = (
-                                        logical,
-                                        allocated,
-                                    )
-                                skipped += 1
+                                extra = extensions.setdefault(base_ref, {'names': [], 'streams': {}})
+                                extra['names'].extend(details['names'])
+                                extra['streams'].update(details['streams'])
                             elif name:
+                                if len(details['names']) > 1 or details['attribute_list']:
+                                    record_details[frn] = details
                                 file_attributes |= FILE_ATTRIBUTE_DIRECTORY if is_directory else 0
                                 records[frn] = FileRecord(
                                     frn,
@@ -454,11 +482,14 @@ def enumerate_mft(
                                     allocated_size=allocated,
                                     size_ready=True,
                                     modified=modified,
+                                    link_count=max(1, struct.unpack_from("<H", pending, rec_off + 0x12)[0]),
                                 )
                             else:
                                 skipped += 1
                         else:
                             skipped += 1
+                    else:
+                        skipped += 1
                 record_index += 1
                 rec_off += record_size
             del pending[:usable]
@@ -498,19 +529,59 @@ def enumerate_mft(
                 bytes_seen += len(data)
                 consume_pending()
         consume_pending()
+        if bytes_seen < valid:
+            raise OSError("$MFT read ended before its valid length; scan is incomplete.")
     finally:
         kernel32.CloseHandle(handle)
 
-    for frn, record in records.items():
-        extra = extension_sizes.get(frn & NTFS_RECORD_NUMBER_MASK)
-        if extra and not record.is_directory and record.logical_size == 0 and record.allocated_size == 0:
-            record.logical_size, record.allocated_size = extra
-            if record.attributes & FILE_ATTRIBUTE_SPARSE_FILE:
-                record.logical_size = min(record.logical_size, record.allocated_size)
-
+    skipped += _complete_mft_records(records, record_details, extensions, cancelled)
 
     if progress:
         progress(len(records))
     if progress_details:
         progress_details(len(records), 1.0)
     return records, skipped
+
+
+def _complete_mft_records(records, record_details, extensions, cancelled=None):
+    """Join extension attributes, then retain paths without duplicating allocation."""
+    skipped = 0
+    for frn, extra in extensions.items():
+        if cancelled and cancelled():
+            raise InterruptedError("MFT scan cancelled.")
+        record = records.get(frn)  # Full reference includes sequence: reject stale bases.
+        if record is None:
+            skipped += 1
+            continue
+        details = record_details.setdefault(frn, {'names': [(record.parent_frn, record.name)],
+                                                'streams': {(ATTR_DATA, b''): (record.logical_size, record.allocated_size)}})
+        details['names'].extend(extra['names'])
+        # First extents contain whole-stream sizes; continuation extents add no size.
+        details['streams'].update(extra['streams'])
+        record.logical_size = details['streams'].get((ATTR_DATA, b''), (0, 0))[0]
+        record.allocated_size = sum(size[1] for size in details['streams'].values())
+    alias_id = -1
+    for frn, details in record_details.items():
+        if cancelled and cancelled():
+            raise InterruptedError("MFT scan cancelled.")
+        record = records[frn]
+        if record.is_directory:
+            continue  # Never synthesize directory aliases or follow junctions.
+        aliases = list(dict.fromkeys(tuple(pair) for pair in details['names']))
+        if aliases and (record.parent_frn, record.name) not in aliases:
+            record.parent_frn, record.name = aliases[0]  # Long name may be in an extension; omit its DOS alias.
+        seen = {(record.parent_frn, record.name)}
+        record.link_count = max(record.link_count, len(set(aliases) | seen))
+        for parent, name in aliases:
+            if (parent, name) in seen:
+                continue
+            seen.add((parent, name))
+            # Negative IDs are internal path-entry IDs, never native file IDs.
+            while alias_id in records:
+                alias_id -= 1
+            records[alias_id] = FileRecord(alias_id, parent, name, record.attributes,
+                logical_size=record.logical_size, allocated_size=0,
+                size_ready=record.size_ready, modified=record.modified, hardlink_to=frn,
+                link_count=record.link_count)
+            alias_id -= 1
+    return skipped

@@ -45,7 +45,7 @@ def attribute_names(attributes: int) -> list[str]:
     return [name for flag, name in _ATTRIBUTE_NAMES if attributes & flag]
 
 
-def installed_apps() -> list[dict]:
+def installed_apps(*,seconds: float | None = None) -> list[dict]:
     """Programs from the Windows uninstall registry, with the folder each one lives in."""
     try:
         import winreg
@@ -55,6 +55,7 @@ def installed_apps() -> list[dict]:
     views = ((winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_64KEY), (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY),
              (winreg.HKEY_CURRENT_USER, 0))
     apps: dict[str, dict] = {}
+    deadline=time.monotonic()+seconds if seconds is not None else float('inf')
     for hive, view in views:
         try:
             root = winreg.OpenKey(hive, key_path, 0, winreg.KEY_READ | view)
@@ -62,6 +63,7 @@ def installed_apps() -> list[dict]:
             continue
         with root:
             for index in range(winreg.QueryInfoKey(root)[0]):
+                if time.monotonic()>=deadline:break
                 try:
                     with winreg.OpenKey(root, winreg.EnumKey(root, index)) as key:
                         values = {}
@@ -74,6 +76,7 @@ def installed_apps() -> list[dict]:
                 if not name or values.get("SystemComponent") == 1:
                     continue
                 location = str(values.get("InstallLocation") or "").strip().strip('"')
+                registered_location=ntpath.normpath(location) if location else None
                 if not location:
                     icon = str(values.get("DisplayIcon") or "").split(",")[0].strip().strip('"')
                     location = ntpath.dirname(icon) if icon.lower().endswith(".exe") else ""
@@ -111,7 +114,14 @@ def installed_apps() -> list[dict]:
                     "registry_size": format_bytes(int(size) * 1024) if isinstance(size, int) else None,
                     "estimated_bytes": int(size) * 1024 if isinstance(size, int) else 0,
                     "uninstall_string": uninstaller,
+                    "registered_location":registered_location,
+                    "location_basis":"InstallLocation" if registered_location else "DisplayIcon inference",
+                    "no_remove":bool(values.get('NoRemove')),
+                    "child_or_update":bool(values.get('ParentKeyName') or values.get('ReleaseType')),
+                    "system_component":bool(values.get('SystemComponent')),
                 }
+    # ponytail: conversational callers can bound inventory work; missing records
+    # remain unknown. Existing unbounded profile callers retain full enumeration.
     return list(apps.values())
 
 

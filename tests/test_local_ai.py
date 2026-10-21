@@ -103,7 +103,7 @@ class ConversationTests(unittest.TestCase):
             opener.return_value.open.side_effect = TimeoutError("timed out")
             assistant = ConversationAssistant(sample_scan())
             answer = assistant.answer("Give me an overview")
-        self.assertIn("did not finish within 30 seconds", answer)
+        self.assertIn("stopped responding for 30 seconds", answer)
         self.assertNotIn("No external AI service is connected", answer)
         self.assertIn("Basic scan answer", answer)
 

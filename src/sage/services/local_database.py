@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import ntpath
 import os
 import sqlite3
@@ -96,6 +97,24 @@ class DriveIndex:
                 conn.execute('INSERT INTO content_fts(rowid,path,snippet) SELECT rowid,path,snippet FROM content_chunks')
                 conn.execute('PRAGMA user_version=2')
         self._ready = True
+
+    def record_fact(self, path, field, value, answer, *, source, scan_time=None):
+        """Persist and read back a measurement without blocking the file-index writer."""
+        # The index writes a scan in one transaction. A small SQLite sidecar keeps
+        # queried analytics independent of that writer; the existing index is unchanged.
+        path_db=Path(self.db_path)
+        conn=sqlite3.connect(str(path_db.with_name(path_db.stem+'-facts'+path_db.suffix)),timeout=.5)
+        try:
+            with conn:
+                conn.execute('CREATE TABLE IF NOT EXISTS facts (path TEXT COLLATE NOCASE, field TEXT, value_json TEXT, '
+                             'answer TEXT, source TEXT, scan_time TEXT, measured_at INTEGER, PRIMARY KEY(path,field))')
+                conn.execute('INSERT OR REPLACE INTO facts VALUES (?,?,?,?,?,?,?)',
+                             (path,field,json.dumps(value),answer,source,scan_time,int(time.time())))
+                row=conn.execute('SELECT value_json,answer,source,scan_time,measured_at FROM facts WHERE path=? AND field=?',
+                                 (path,field)).fetchone()
+            return {'path':path,'field':field,'value':json.loads(row[0]),'answer':row[1],
+                    'source':row[2],'scan_time':row[3],'measured_at':row[4]}
+        finally:conn.close()
 
     @staticmethod
     def _safe_for_content_index(path: str, extension: str, is_reparse: bool) -> bool:
@@ -393,7 +412,7 @@ class DriveIndex:
 
     def search_metadata(self, *, scope: str, query: str = '', kind: str = 'any', extension: str = '',
                         minimum_bytes: int = 0, modified_before: int = 0, modified_after: int = 0,
-                        sort: str = 'largest', limit: int = 8) -> list[dict]:
+                        sort: str = 'largest', limit: int = 8, offset: int = 0) -> list[dict]:
         self.ensure_schema()
         # instr avoids LIKE wildcard names and enforces folder boundaries.
         prefix = ntpath.normpath(scope).rstrip('\\').casefold() + '\\'
@@ -410,14 +429,14 @@ class DriveIndex:
             where.append('modified_time>0 AND modified_time<?'); args.append(modified_before)
         if modified_after:
             where.append('modified_time>=?'); args.append(modified_after)
-        order = {'largest':'allocated_bytes DESC','recent':'modified_time DESC','oldest':'modified_time ASC','name':'name ASC'}[sort]
+        order = {'largest':'allocated_bytes DESC','recent':'modified_time DESC','oldest':'modified_time ASC','name':'casefold(name) ASC'}[sort]
         if sort in {'recent','oldest'}:
             where.append('modified_time>0')
-        args.append(limit)
+        args.extend((limit,offset))
         with self._connect() as conn:
             return [dict(row) for row in conn.execute(
                 'SELECT path,name,is_directory,logical_bytes,allocated_bytes,modified_time FROM files WHERE '
-                + ' AND '.join(where) + ' ORDER BY ' + order + ',path LIMIT ?', args)]
+                + ' AND '.join(where) + ' ORDER BY ' + order + ',casefold(path),path LIMIT ? OFFSET ?', args)]
 
     def possible_duplicates(self, scope: str, limit: int = 5) -> dict:
         self.ensure_schema()

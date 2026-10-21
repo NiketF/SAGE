@@ -408,6 +408,14 @@ class AssistantPanel(ttk.Frame):
             self.activity_text.set(self._phase)
         self._spinner_job = self.after(300, self._animate)
 
+    def reset_reply(self) -> None:
+        """Replace a rejected generation within the current assistant message."""
+        if self._render_job:
+            self.after_cancel(self._render_job)
+            self._render_job = None
+        self._reply_buffer = ""
+        self._render_reply()
+
     def append_reply(self, text: str) -> None:
         if self._reply_mark is None:
             return

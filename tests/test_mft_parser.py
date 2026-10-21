@@ -89,7 +89,7 @@ class MftParserTests(unittest.TestCase):
         self.assertEqual(parse_mft_file_record(folder)[3], "Docs")
         self.assertIsNone(parse_mft_file_record(unused))
 
-    def test_parses_sparse_nonresident_data_and_clamps_virtual_size(self):
+    def test_parses_sparse_nonresident_data_preserving_virtual_size(self):
         # 512 GB virtual sparse file with 0 physical allocation (e.g. userdata.img)
         sparse_virtual = 512 * 1024 * 1024 * 1024
         file_record = make_mft_record(
@@ -98,7 +98,7 @@ class MftParserTests(unittest.TestCase):
         )
         parsed = parse_mft_file_record(file_record)
         self.assertIsNotNone(parsed)
-        self.assertEqual(parsed[5:7], (0, 0))
+        self.assertEqual(parsed[5:7], (sparse_virtual, 0))
 
     def test_parses_compressed_nonresident_data_sizes(self):
         # 10 MB logical file compressed to 3 MB allocated on disk
@@ -118,7 +118,7 @@ class MftParserTests(unittest.TestCase):
         )
         parsed = parse_mft_file_record(file_record)
         self.assertIsNotNone(parsed)
-        self.assertEqual(parsed[5:7], (4_194_304, 4_194_304))
+        self.assertEqual(parsed[5:7], (100_000_000, 4_194_304))
 
     def test_reads_modified_time_attributes_and_only_keeps_link_reparse_flag(self):
         modified = 116444736000000000 + 1_700_000_000 * 10_000_000
