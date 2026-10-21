@@ -50,6 +50,7 @@ class ToolRegistry:
         self.index = index
         self.analytics_index = index
         self.focus=[]
+        self.subject_scope=[]
         self._cleanup_cache=None
 
     def cleanup_suggestions(self):
@@ -113,7 +114,7 @@ class ToolRegistry:
             'search_content':'Search approved local text excerpts. Missing results never prove no reference exists.',
             'find_references':'Find text that mentions a filename or identifier. Matches are clues, not verified runtime dependencies.',
             'find_duplicates':'Find possible duplicates by measured size. File contents are not compared.',
-            'cleanup_candidates':'Get existing cleanup rules and their conditions.'}
+            'cleanup_candidates':'Get existing cleanup items in their original order, plus separate optional application uninstall reviews. Never delete application folders directly.'}
         return [{'type':'function','function':{'name':name,'description':description,
             'parameters':{'type':'object','properties':{key:fields[key] for key in (*self._SPECS[name].required,*self._SPECS[name].optional)},
                           'required':list(self._SPECS[name].required),'additionalProperties':False}}}
@@ -203,7 +204,10 @@ class ToolRegistry:
             items=self.cleanup_suggestions()
             scope=arguments['scope']
             return {'items':[{'path':s.path,'space':format_bytes(s.allocated),'reason':s.reason,'conditions':s.title}
-                             for s in items if self.evidence.within(s.path,scope)][:arguments.get('limit',8)],'read_only':True}
+                             for s in items if self.evidence.within(s.path,scope)][:arguments.get('limit',8)],'read_only':True,
+                    'optional_applications':self._optional_applications(scope,arguments.get('limit',8)),
+                    'application_coverage':'Partial native installation inventory; missing records do not establish absence or disuse.'}
+
         if name == 'find_duplicates':
             return self.index.possible_duplicates(arguments['scope'],arguments.get('limit',5)) if self.index else {'groups':[],'warning':'Index is still being built. No content comparison was performed.'}
         if name == 'find_references':
@@ -351,6 +355,64 @@ class ToolRegistry:
             return result
 
         raise ValueError(f"Unsupported tool: {name}")
+
+    def resolve_subject(self,query,limit=8):
+        """Resolve AI-interpreted names without changing general search semantics."""
+        if not self.evidence:return {'items':[],'coverage':'No scan loaded.'}
+        if ntpath.isabs(query):
+            item=self.evidence.inspect(query)
+            return {'items':[] if 'error' in item else [item],'partial':False}
+        # Multiple conversational targets do not establish one preferred parent.
+        scopes=(list(self.subject_scope) if len(self.subject_scope)==1 else [])+[None]
+        for scope in scopes:
+            if scope:
+                current=self.evidence.inspect(scope)
+                if 'error' in current:continue
+                if current['kind']=='file':scope=ntpath.dirname(scope)
+            matches=self.evidence.resolve_name(query,scope,limit=limit+1)
+            match_type='exact name'
+            if not matches:
+                matches=self.evidence.loose_folders(query,scope,limit=limit+1)
+                match_type='normalized folder name'
+            if matches:
+                return {'items':matches[:limit],'partial':len(matches)>limit,'match_type':match_type,
+                        'resolution':'conversation scope' if scope else 'retained hierarchy',
+                        'instruction':'Inspect the unique target. If alternatives remain, clarify before a change assessment.'}
+        return {'items':[],'coverage':'No exact or normalized folder-name match in retained scan records. Skipped or unscanned records remain unknown.'}
+
+    def _optional_applications(self,scope,limit):
+        """Advice only: never add app folders to the existing deletion allowlist."""
+        apps=[];seen=set()
+        windows=os.environ.get('SystemRoot')
+        inventory=self.evidence._installed_applications()
+        # ponytail: stop optional inventory matching after 40 ms. This is a
+        # partial review list, not an exhaustive application/dependency audit.
+        deadline=time.monotonic()+.04
+        for app in inventory:
+            if time.monotonic()>=deadline:break
+            path=app['location'];key=ntpath.normcase(path)
+            if key in seen or not self.evidence.within(path,scope):continue
+            if not app.get('uninstall_available') or any(app.get(flag) for flag in ('system_component','no_remove','child_or_update')):continue
+            if windows and self.evidence.within(path,windows):continue
+            item=self.evidence.inspect(path)
+            if 'error' in item or item['kind']!='folder' or item.get('is_reparse_point'):continue
+            current=item['frn'];ancestors=set();protected=False
+            while current not in ancestors and current in self.evidence.result.records:
+                ancestors.add(current);record=self.evidence.result.records[current]
+                if record.attributes & (0x400|0x4):protected=True;break
+                if current==self.evidence.result.root_frn:break
+                current=record.parent_frn
+            if protected:continue
+            # A shared install root is not one application's removable directory.
+            if any(ntpath.normcase(path)==ntpath.normcase(os.environ.get(key,'')) for key in
+                   ('ProgramFiles','ProgramFiles(x86)','ProgramData','USERPROFILE','APPDATA','LOCALAPPDATA')):continue
+            seen.add(key)
+            apps.append({'name':app['name'],'path':item['path'],'publisher':app.get('publisher',''),
+                         'action':'review_for_uninstall','method':'Windows Installed apps or the application uninstaller',
+                         'conditions':'Only if you no longer need the application. Check dependent work and preserve needed data first.',
+                         'limits':'Registration does not verify current use, dependencies or safety. Do not delete its folder directly.'})
+            if len(apps)>=limit:break
+        return apps
 
     def _record_fact(self,path,field,value,answer,**metadata):
         index=self.analytics_index or self.index

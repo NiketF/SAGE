@@ -102,7 +102,15 @@ class ScanEvidence:
                                         name = winreg.QueryValueEx(key, "DisplayName")[0]
                                         location = winreg.QueryValueEx(key, "InstallLocation")[0]
                                         if isinstance(name, str) and isinstance(location, str) and ntpath.isabs(location) and ntpath.dirname(ntpath.normpath(location)) != ntpath.normpath(location):
-                                            apps.append({"name": name[:100], "location": ntpath.normpath(location)})
+                                            def value(field, default=None):
+                                                try:return winreg.QueryValueEx(key,field)[0]
+                                                except OSError:return default
+                                            apps.append({"name":name[:100],"location":ntpath.normpath(location),
+                                                "publisher":str(value('Publisher',''))[:100],
+                                                "uninstall_available":bool(value('UninstallString') or value('QuietUninstallString')),
+                                                "system_component":value('SystemComponent',0)!=0,
+                                                "no_remove":value('NoRemove',0)!=0,
+                                                "child_or_update":bool(value('ParentKeyName') or value('ReleaseType'))})
                                 except OSError:
                                     continue
                     except OSError:
