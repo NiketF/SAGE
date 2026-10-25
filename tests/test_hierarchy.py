@@ -61,7 +61,7 @@ class HierarchyTests(unittest.TestCase):
         self.assertEqual(totals[5], (13, 24))
         self.assertTrue(result.sizes_complete)
 
-    def test_sparse_file_virtual_size_does_not_inflate_directory_totals(self):
+    def test_sparse_logical_size_is_distinct_from_physical_totals(self):
         from sage.config import FILE_ATTRIBUTE_SPARSE_FILE
         records = {
             5: FileRecord(5, 5, ".", FILE_ATTRIBUTE_DIRECTORY),
@@ -72,8 +72,8 @@ class HierarchyTests(unittest.TestCase):
         }
         result = build_scan_result(VolumeInfo("C:", "System", "NTFS"), records)
         totals = calculate_directory_sizes(result)
-        self.assertEqual(totals[10], (100, 128))
-        self.assertEqual(totals[5], (100, 128))
+        self.assertEqual(totals[10], (512 * 1024**3 + 100, 128))
+        self.assertEqual(totals[5], (512 * 1024**3 + 100, 128))
 
     def test_path_builder_stops_on_cycle(self):
         result = make_result()

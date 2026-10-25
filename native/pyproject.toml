@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "sage-native"
+version = "0.1.0"
+description = "Native NTFS $MFT scanner for SAGE"
+requires-python = ">=3.11"
+
+[tool.maturin]
+module-name = "sage_native"
+features = ["pyo3/extension-module"]

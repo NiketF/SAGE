@@ -22,6 +22,9 @@ class FileRecord:
     size_ready: bool = False
     modified: int = 0  # Unix seconds from $STANDARD_INFORMATION; 0 when unknown.
 
+    hardlink_to: int | None = None  # Alias entry ID differs from its underlying NTFS file ID.
+    link_count: int = 1
+
     @property
     def is_directory(self) -> bool:
         return bool(self.attributes & FILE_ATTRIBUTE_DIRECTORY)

@@ -14,14 +14,22 @@ progress, then tree-building activity. Folder and file icons distinguish items
 in the tree. Size columns are filled from the MFT records; a directory-walk
 size pass runs only if a record had no `$DATA` size.
 
+The `$MFT` read and parse runs in a native Rust module (`sage_native`) when it
+is installed, and in pure Python otherwise. See
+[Native scanner (Rust)](#native-scanner-rust).
+
 ## Requirements
 
 - Windows 10 or 11
 - Python 3.11 or newer
 - An NTFS fixed drive
 - Administrator approval for raw volume access
+- Optional, for the fast scanner: the Rust toolchain and the Microsoft C++
+  Build Tools (only needed to *build* `sage_native`, not to run SAGE)
 
-The runtime and automated tests use only the Python standard library.
+The runtime and automated tests use only the Python standard library. The
+native scanner is an optional compiled extension; without it SAGE uses the
+original Python scanner with identical results.
 Conversational answers additionally need Ollama running locally with
 `qwen3.5:4b` downloaded. Scanning and basic evidence answers still work if
 Ollama is unavailable.
@@ -179,13 +187,95 @@ sage
 
 SAGE requests UAC elevation on launch. A cancelled UAC prompt ends the launch.
 
+## Native scanner (Rust)
+
+Reading `$MFT` from disk is fast; decoding millions of 1 KB FILE records one
+at a time in Python is not. The `native/` folder contains a Rust extension
+module, `sage_native`, that performs the same work as
+`platform/windows/mft.py`:
+
+- A dedicated reader thread streams `$MFT` from the raw volume in 4 MB chunks
+  while earlier chunks are parsed, so disk reads and parsing overlap.
+- Each chunk's FILE records are fixed up and parsed in parallel on all CPU
+  cores (Rayon). Records are then applied in on-disk order, so results are
+  deterministic.
+- Extension records, `$ATTRIBUTE_LIST` bases and hard-link aliases are joined
+  exactly as the Python scanner does.
+- The scan releases Python's global interpreter lock, so the Tkinter UI stays
+  responsive. Progress and cancellation callbacks still work.
+- Results return as column lists (IDs, parents, names, sizes, …). Python
+  builds its usual `FileRecord` objects from them in one pass, so the rest of
+  SAGE (tree, hierarchy, evidence, assistant) is unchanged.
+
+### Build and install
+
+One-time setup:
+
+```powershell
+winget install Rustlang.Rustup
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+python -m pip install "maturin>=1.5,<2"
+```
+
+Build the module into the current Python environment. Run this in a new
+terminal after installing the tools, and again after changing anything in
+`native/`:
+
+```powershell
+python -m pip install ./native
+```
+
+For a faster edit/build loop during development, use
+`python -m maturin develop --release -m native/Cargo.toml` instead.
+
+The module is a stable-ABI (`abi3`) build, so one wheel works on Python 3.11
+and newer. To produce a wheel for other machines (which then need no Rust
+toolchain), run `python -m maturin build --release -m native/Cargo.toml` and
+install the file from `native/target/wheels/` with `pip install`.
+
+### Choosing the backend
+
+`sage.platform.windows.mft.enumerate_mft` uses `sage_native` automatically
+when it imports and its `ABI_VERSION` matches. Otherwise it uses the Python
+scanner. To force the Python scanner (for comparison or troubleshooting):
+
+```powershell
+$env:SAGE_SCANNER = "python"
+python run_sage.py
+```
+
+`mft.scan_backend()` reports which backend is active.
+
+### Measure the speed-up
+
+From an elevated (Administrator) terminal:
+
+```powershell
+$env:PYTHONPATH = "src"
+python scripts/benchmark_scan.py C:
+```
+
+The script scans the drive once with each backend. For each run it prints
+the time to read and parse `$MFT`, the time to build the tree and folder
+sizes, and the record and size totals. The two backends should report the
+same totals, apart from files created or deleted between the runs.
+
 ## Validate
 
 ```powershell
 python -m compileall -q src tests
-$env:PYTHONPATH = "src"
+$env:PYTHONPATH = "src;tests"
 python -m unittest discover -s tests -v
 ```
+
+`tests/test_native_mft.py` runs only when `sage_native` is installed. It
+parses a synthetic `$MFT` image containing directories, resident,
+non-resident, sparse and compressed files, hard links, DOS names, extension
+records, reparse points, and torn or deleted records. The Rust and Python
+results must match exactly. It then repeats the comparison on 3,000 randomly
+corrupted copies of that image to check that malformed records are handled
+identically and never crash the native module. Rust unit tests run with
+`cargo test --manifest-path native/Cargo.toml`.
 
 ## Architecture
 
@@ -193,7 +283,12 @@ python -m unittest discover -s tests -v
   NTFS update-sequence fixup, and parses FILE records for names, parents,
   unnamed `$DATA` sizes, modified time, and attributes. Only junctions and
   symlinks keep the link attribute; OneDrive placeholders and compressed files
-  do not.
+  do not. `enumerate_mft` delegates to `sage_native` when it is installed;
+  the Python code is the reference implementation and fallback.
+- `native/` is the Rust crate for `sage_native`: `src/mft.rs` (record
+  parsing and assembly), `src/volume.rs` (volume geometry and the pipelined
+  `$MFT` reader), and `src/lib.rs` (Python bindings).
+- `scripts/benchmark_scan.py` times both scanner backends on a real drive.
 - `platform/windows/file_operations.py` handles Windows Shell copy/move/rename
   and Recycle Bin actions, plus permanent delete and emptying the Recycle Bin
   from chat cleanup buttons.
@@ -246,11 +341,14 @@ delete actions require confirmation.
 - File sizes are taken from unnamed `$DATA` on each in-use MFT record during
   the sequential `$MFT` read. Folder totals are summed in memory afterward.
   A Windows directory metadata walk remains only as fallback for records that
-  had no MFT size. Scanning is I/O-bound on `$MFT` (typically hundreds of MB),
-  not on opening every folder on the volume. Python is still slower than a
-  native C++ tool such as WizTree, but it no longer scales with directory-walk
-  syscalls. `$MFT` mapping pairs are read from record 0; volumes that store
+  had no MFT size. Scanning reads `$MFT` (typically hundreds of MB) rather than
+  opening every folder on the volume. With `sage_native` the read and parse
+  are native and multi-core. Building the in-memory tree and the Python
+  `FileRecord` objects still runs in Python after the native scan.
+  `$MFT` mapping pairs are read from record 0; volumes that store
   those runs only in `$ATTRIBUTE_LIST` are not handled.
+- Only NTFS volumes are scanned. FAT32/exFAT drives (most USB sticks and SD
+  cards) are rejected rather than walked.
 - Folder allocation totals sum contained files. NTFS directory metadata overhead
   is not included.
 - Active MFT records are analyzed. Deleted-record forensics, alternate data

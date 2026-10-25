@@ -1,0 +1,19 @@
+[package]
+name = "sage-native"
+version = "0.1.0"
+edition = "2021"
+description = "Native NTFS $MFT scanner for SAGE"
+publish = false
+
+[lib]
+name = "sage_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["abi3-py311"] }
+rayon = "1.10"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3

@@ -7,3 +7,6 @@ dist/
 build/
 *.zip
 sage-startup.log
+native/target/
+*.pyd
+benchmark-scan.log
