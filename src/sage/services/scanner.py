@@ -42,15 +42,18 @@ def scan_ntfs(
     if stage:
         stage("Building MFT hierarchy")
     readiness_started = time.perf_counter()
-    files = [record for record in records.values() if not record.is_directory]
-    sizes_ready = all(record.size_ready for record in files)
+    # Single generator walk instead of list materialization + second iteration.
+    # Still O(N) in the common all-True case, but roughly halves this phase's cost.
+    sizes_ready = all(r.size_ready for r in records.values() if not r.is_directory)
     if timings is not None:
         timings['file_readiness_seconds'] = time.perf_counter() - readiness_started
     hierarchy_started = time.perf_counter()
     result = build_scan_result(volume, records, skipped, include_sizes=sizes_ready)
     hierarchy_seconds = time.perf_counter() - hierarchy_started
     if sizes_ready:
-        result.sized_files = len(files)
+        # Non-directory count is already produced by calculate_stats as stats[root][1].
+        root_totals = result.stats.get(result.root_frn)
+        result.sized_files = root_totals[1] if root_totals is not None else 0
     if timings is not None:
         timings.update(hierarchy_and_counts_seconds=hierarchy_seconds,
                        hierarchy_and_totals_seconds=hierarchy_seconds if sizes_ready else None,
