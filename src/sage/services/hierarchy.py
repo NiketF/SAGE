@@ -41,6 +41,8 @@ def build_scan_result(
     volume: VolumeInfo,
     records: dict[int, FileRecord],
     skipped_records: int = 0,
+    *,
+    include_sizes: bool = False,
 ) -> ScanResult:
     root_frn = find_root(records)
     children: defaultdict[int, list[int]] = defaultdict(list)
@@ -60,7 +62,7 @@ def build_scan_result(
         root_frn=root_frn,
         skipped_records=skipped_records,
     )
-    calculate_stats(result)
+    calculate_stats(result, include_sizes=include_sizes)
     return result
 
 
@@ -85,12 +87,18 @@ def _directory_postorder(result: ScanResult) -> list[int]:
     return order
 
 
-def calculate_stats(result: ScanResult) -> dict[int, tuple[int, int, int]]:
-    """Map each directory to recursive (items, files, folders) counts."""
+def calculate_stats(result: ScanResult, *, include_sizes: bool = False) -> dict[int, tuple[int, int, int]]:
+    """Aggregate counts, and optionally ready sizes, in one bottom-up pass."""
     totals: dict[int, tuple[int, int, int]] = {}
+    size_totals: dict[int, tuple[int, int]] = {}
     for frn in _directory_postorder(result):
         files = 0
         folders = 0
+        logical = 0
+        allocated = 0
+        if include_sizes:
+            own = result.records[frn]
+            allocated = own.allocated_size if own.size_ready else 0
         for child_frn in result.children.get(frn, ()):
             child = result.records.get(child_frn)
             if child is None:
@@ -99,10 +107,22 @@ def calculate_stats(result: ScanResult) -> dict[int, tuple[int, int, int]]:
                 child_items, child_files, child_folders = totals.get(child_frn, (0, 0, 0))
                 files += child_files
                 folders += child_folders + 1
+                if include_sizes:
+                    child_logical, child_allocated = size_totals.get(child_frn, (0, 0))
+                    logical += child_logical
+                    allocated += child_allocated
             else:
                 files += 1
+                if include_sizes:
+                    logical += child.logical_size
+                    allocated += child.allocated_size
         totals[frn] = (files + folders, files, folders)
+        if include_sizes:
+            size_totals[frn] = (logical, allocated)
     result.stats = totals
+    if include_sizes:
+        result.directory_sizes = size_totals
+        result.sizes_complete = True
     return totals
 
 

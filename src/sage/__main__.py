@@ -40,9 +40,19 @@ def _show_fatal_error(message: str) -> None:
 
 def main() -> int:
     try:
+        # Command-line options survive UAC; environment overrides may not.
+        if '--scan-timings' in sys.argv[1:]:
+            os.environ['SAGE_SCAN_TIMINGS'] = '1'
+        for option in sys.argv[1:]:
+            if option.startswith('--mft-parser='):
+                choice = option.split('=', 1)[1]
+                if choice not in {'auto', 'python', 'c'}:
+                    raise ValueError('--mft-parser must be auto, python or c.')
+                os.environ['SAGE_MFT_PARSER'] = choice
         _log(
             f"start pid={os.getpid()} cwd={os.getcwd()!r} "
-            f"executable={sys.executable!r} argv={sys.argv!r} admin={is_admin()}"
+            f"executable={sys.executable!r} argv={sys.argv!r} admin={is_admin()} "
+            f"scan_timings={os.environ.get('SAGE_SCAN_TIMINGS') == '1'}"
         )
         if os.name != "nt":
             raise RuntimeError("SAGE is a Windows-only NTFS application.")

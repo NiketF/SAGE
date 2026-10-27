@@ -21,6 +21,7 @@ from ..services.evidence import EvidenceAssistant, format_bytes
 from ..services.local_ai import OllamaClient
 from ..services.conversation import DriveAssistant as ConversationAssistant
 from ..services.scanner import analyze_sizes, scan_ntfs
+from ..services.scan_timing import write_scan_timings
 from .assistant_panel import AssistantPanel
 from .styles import ACCENT, SURFACE, TEXT, TEXT_SECONDARY, configure_styles
 from .tree_panel import TreePanel
@@ -269,11 +270,14 @@ class SageApplication(tk.Tk):
 
     def _scan_worker(self, generation: int, drive: str, cancel: threading.Event) -> None:
         try:
+            progress = _ScanProgress(self._events, generation)
             result = scan_ntfs(
                 drive,
-                progress=_ScanProgress(self._events, generation),
+                progress=progress,
                 cancelled=cancel.is_set,
             )
+            if hasattr(progress, 'scan_timings') and generation == self._generation:
+                self._scan_timings = (generation, progress.scan_timings)
             self._events.put(("scan_done", generation, result))
         except InterruptedError:
             self._events.put(("cancelled", generation))
@@ -363,6 +367,16 @@ class SageApplication(tk.Tk):
                         self._pending_size_completion = event[2]
                     else:
                         self._size_finished(event[2])
+                elif kind == 'cleanup_done':
+                    self._cleanup_finished(*event[2:])
+                elif kind == 'cleanup_error':
+                    _, _, result, conversation, error = event
+                    if result is self._result and conversation is self._conversation:
+                        self.status_var.set('Tree ready — cleanup suggestions could not be prepared.')
+                        pending = getattr(self, '_scan_timings', None)
+                        if pending and pending[0] == self._generation:
+                            pending[1].update(cleanup_status='failed', cleanup_error_type=type(error).__name__)
+                            write_scan_timings(pending[1])
                 elif kind == "assistant_answer":
                     self._assistant_busy = False
                     self.assistant_panel.finish_reply(event[3])
@@ -412,7 +426,12 @@ class SageApplication(tk.Tk):
             self.after(50, self._drain_events)
 
     def _scan_finished(self, result: ScanResult) -> None:
+        handler_started = time.monotonic()
+        pending = getattr(self, '_scan_timings', None)
+        timings = pending[1] if pending and pending[0] == self._generation else None
         self._mft_elapsed = time.monotonic() - self._scan_started_at
+        if timings is not None:
+            timings['scan_to_ui_handler_seconds'] = self._mft_elapsed
         self._size_started_at = time.monotonic()
         self._result = result
         self._assistant.set_result(result)
@@ -421,7 +440,10 @@ class SageApplication(tk.Tk):
             self.assistant_panel.finish_reply("The new drive tree is ready. Please ask your question again.")
             self._assistant_busy = False
         self._conversation = ConversationAssistant(result)
+        tree_started = time.monotonic()
         self.tree_panel.show_result(result)
+        if timings is not None:
+            timings['tree_insert_seconds'] = time.monotonic() - tree_started
         self.assistant_panel.set_selected_item(None)
         self._update_drive_info()
         self.assistant_panel.write("SAGE", self._assistant.scan_summary())
@@ -429,6 +451,16 @@ class SageApplication(tk.Tk):
         self.scan_button.configure(text="Scan drive")
         if result.sizes_complete:
             self._size_finished(result)
+            if timings is not None:
+                timings['ui_completion_handler_seconds'] = time.monotonic() - handler_started
+                scan_started = self._scan_started_at
+                generation = self._generation
+                def save_idle_timing():
+                    if generation == self._generation:
+                        timings.update(status='tree_ready' if timings.get('cleanup_status') == 'running' else 'complete',
+                                       scan_to_first_idle_seconds=time.monotonic() - scan_started)
+                        write_scan_timings(timings)
+                self.after_idle(save_idle_timing)
             return
         self.progress_bar.configure(mode="determinate", value=0)
         self.progress_phase.set("Measuring file sizes")
@@ -455,16 +487,46 @@ class SageApplication(tk.Tk):
         self._update_drive_info()
         self.assistant_panel.write("SAGE", self._assistant.size_summary())
         if result.volume.drive.upper() == "C:":
-            suggestions = self._conversation.cleanup_suggestions()
-            self.assistant_panel.write("SAGE", cleanup_report(result, suggestions))
-            self.assistant_panel.add_cleanup_actions(suggestions, self._delete_suggestion)
-            self._conversation.remember_suggestions(suggestions)
+            pending = getattr(self, '_scan_timings', None)
+            if pending and pending[0] == self._generation:
+                pending[1]['cleanup_status'] = 'running'
+            # Same immutable scan and assistant snapshot; Tk is touched only on completion.
+            threading.Thread(target=self._cleanup_worker,
+                args=(generation, result, self._conversation), daemon=True, name='sage-cleanup').start()
         self.status_var.set(
             f"Ready — MFT {self._mft_elapsed:.1f}s, "
             f"sizes {time.monotonic() - self._size_started_at:.1f}s, "
             f"{len(result.records):,} records, "
             f"{result.size_errors:,} unreadable files"
         )
+
+    def _cleanup_worker(self, generation, result, conversation):
+        started = time.monotonic()
+        try:
+            suggestions = conversation.cleanup_suggestions()
+            self._events.put(('cleanup_done', generation, result, conversation, suggestions,
+                              time.monotonic() - started))
+        except Exception as exc:
+            self._events.put(('cleanup_error', generation, result, conversation, exc))
+
+    def _cleanup_finished(self, result, conversation, suggestions, compute_seconds):
+        if result is not self._result or conversation is not self._conversation:
+            return
+        if getattr(self, '_assistant_busy', False) or getattr(self, '_file_operation_running', False):
+            self.after(100, lambda: self._cleanup_finished(result, conversation, suggestions, compute_seconds))
+            return
+        buttons_started = time.monotonic()
+        self.assistant_panel.write('SAGE', cleanup_report(result, suggestions))
+        self.assistant_panel.add_cleanup_actions(suggestions, self._delete_suggestion)
+        conversation.remember_suggestions(suggestions)
+        pending = getattr(self, '_scan_timings', None)
+        if pending and pending[0] == self._generation:
+            button_seconds = time.monotonic() - buttons_started
+            pending[1].update(status='complete', cleanup_status='complete',
+                cleanup_compute_seconds=compute_seconds, cleanup_buttons_seconds=button_seconds,
+                cleanup_and_buttons_seconds=compute_seconds + button_seconds,
+                scan_to_cleanup_ready_seconds=time.monotonic() - self._scan_started_at)
+            write_scan_timings(pending[1])
 
     def _job_failed(self, phase: str, exc: Exception) -> None:
         self.progress_bar.stop()

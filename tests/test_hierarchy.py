@@ -1,8 +1,12 @@
 import unittest
+from dataclasses import replace
+import random
+from unittest.mock import patch
 
 from sage.config import FILE_ATTRIBUTE_DIRECTORY
 from sage.models import FileRecord, VolumeInfo
 from sage.services.hierarchy import build_scan_result, calculate_directory_sizes
+from sage.services import hierarchy
 
 
 def make_result():
@@ -31,6 +35,38 @@ def make_sequenced_records(include_root: bool) -> dict[int, FileRecord]:
 
 
 class HierarchyTests(unittest.TestCase):
+    def test_combined_counts_and_sizes_match_separate_passes(self):
+        rng = random.Random(37)
+        records = {5: FileRecord(5,5,'.',FILE_ATTRIBUTE_DIRECTORY,allocated_size=4096,size_ready=True)}
+        for i in range(6,80):
+            records[i] = FileRecord(i,rng.randrange(5,i),f'dir{i}',FILE_ATTRIBUTE_DIRECTORY,
+                allocated_size=4096,size_ready=i%3!=0)
+        for i in range(80,600):
+            records[i] = FileRecord(i,rng.randrange(5,80),f'file{i}',0,
+                logical_size=512*1024**3 if i%11==0 else i,allocated_size=0 if i%7==0 else 4096,
+                size_ready=True,hardlink_to=80 if i%7==0 else None)
+        records[600] = FileRecord(600,9999,'orphan',0,5,8,size_ready=True)
+        records[601] = FileRecord(601,602,'cycle-a',FILE_ATTRIBUTE_DIRECTORY,size_ready=True)
+        records[602] = FileRecord(602,601,'cycle-b',FILE_ATTRIBUTE_DIRECTORY,size_ready=True)
+        volume = VolumeInfo('C:','Test','NTFS')
+        expected = build_scan_result(volume,{key:replace(row) for key,row in records.items()})
+        calculate_directory_sizes(expected)
+        with patch.object(hierarchy,'_directory_postorder',wraps=hierarchy._directory_postorder) as walk:
+            actual = build_scan_result(volume,{key:replace(row) for key,row in records.items()},include_sizes=True)
+            self.assertEqual(walk.call_count,1)
+        for field in ('records','children','stats','directory_sizes','sizes_complete'):
+            self.assertEqual(getattr(actual,field),getattr(expected,field),field)
+
+    def test_combined_sizes_preserve_synthesized_root(self):
+        records = make_sequenced_records(False)
+        records[11].logical_size = 123
+        records[11].allocated_size = 4096
+        records[11].size_ready = True
+        result = build_scan_result(VolumeInfo('C:','Test','NTFS'),records,include_sizes=True)
+        self.assertEqual(result.root_stats,(2,1,1))
+        self.assertEqual(result.directory_sizes[result.root_frn],(123,4096))
+        self.assertTrue(result.sizes_complete)
+
     def test_finds_sequence_tagged_root_record(self):
         result = build_scan_result(
             VolumeInfo("E:", "Data", "NTFS"), make_sequenced_records(True)

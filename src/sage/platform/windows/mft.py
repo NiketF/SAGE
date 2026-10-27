@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import os
 import struct
+import time
 from collections.abc import Callable, Iterator
 from ctypes import wintypes
 
@@ -395,6 +396,22 @@ def enumerate_mft(
     """Return active NTFS records keyed by file reference number, with sizes filled."""
     if os.name != "nt":
         raise RuntimeError("Native MFT enumeration requires Windows.")
+    parser_choice = os.environ.get('SAGE_MFT_PARSER', 'auto').casefold()
+    if parser_choice not in {'auto', 'python', 'c'}:
+        raise ValueError('SAGE_MFT_PARSER must be auto, python or c.')
+    batch_parser = None
+    if parser_choice != 'python':
+        try:
+            from . import _mft_fast
+        except ImportError:
+            # A missing optional extension is supported; a broken installed one is not.
+            import importlib.util
+            if importlib.util.find_spec(__package__ + '._mft_fast') is not None or parser_choice == 'c':
+                raise
+        else:
+            if _mft_fast.PARSER_VERSION != 1:
+                raise RuntimeError('Compiled MFT parser version mismatch.')
+            batch_parser = _mft_fast.parse_batch
 
     kernel32 = _kernel32()
     volume_path = "\\\\.\\" + drive.rstrip("\\/")
@@ -416,6 +433,9 @@ def enumerate_mft(
     record_details: dict[int, dict] = {}
     extensions: dict[int, dict] = {}
     progress_details = getattr(progress, "on_details", None)
+    timings = getattr(progress, 'scan_timings', None)
+    if timings is not None:
+        timings['parser_backend'] = 'c' if batch_parser is not None else 'python'
 
     try:
         geometry = _volume_data(kernel32, handle)
@@ -423,6 +443,7 @@ def enumerate_mft(
         cluster = geometry.BytesPerCluster
         record_size = geometry.BytesPerFileRecordSegment
         valid = geometry.MftValidDataLength
+        read_started = time.perf_counter()
         first = _read_at(
             kernel32,
             handle,
@@ -430,9 +451,14 @@ def enumerate_mft(
             record_size,
             sector,
         )
+        if timings is not None:
+            timings['mft_read_seconds'] += time.perf_counter() - read_started
         if len(first) < record_size:
             raise OSError("Could not read $MFT record 0.")
+        parse_started = time.perf_counter()
         runs = _mft_data_runs(bytearray(first))
+        if timings is not None:
+            timings['record_parsing_seconds'] += time.perf_counter() - parse_started
         if sum(count for _lcn, count in runs) * cluster < valid:
             raise OSError("$MFT requires additional mapping records; refusing an incomplete scan.")
         if progress:
@@ -448,8 +474,14 @@ def enumerate_mft(
 
         def consume_pending() -> None:
             nonlocal last_reported, record_index, skipped
+            parse_started = time.perf_counter()
             usable = len(pending) - (len(pending) % record_size)
             rec_off = 0
+            if batch_parser is not None:
+                skipped += batch_parser(pending, record_size, record_index, records,
+                                        record_details, extensions, FileRecord, attribute_values)
+                record_index += usable // record_size
+                rec_off = usable
             while rec_off < usable:
                 if pending[rec_off : rec_off + 4] == b"FILE":
                     in_use = struct.unpack_from("<H", pending, rec_off + 0x16)[0] & MFT_IN_USE
@@ -493,6 +525,8 @@ def enumerate_mft(
                 record_index += 1
                 rec_off += record_size
             del pending[:usable]
+            if timings is not None:
+                timings['record_parsing_seconds'] += time.perf_counter() - parse_started
             if (progress or progress_details) and len(records) - last_reported >= MFT_PROGRESS_INTERVAL:
                 fraction = min(0.99, bytes_seen / valid) if valid else None
                 if progress:
@@ -520,7 +554,10 @@ def enumerate_mft(
                 if cancelled and cancelled():
                     raise InterruptedError("MFT scan cancelled.")
                 chunk = min(remaining, MFT_BUFFER_SIZE)
+                read_started = time.perf_counter()
                 data = _read_at(kernel32, handle, disk_offset, chunk, sector)
+                if timings is not None:
+                    timings['mft_read_seconds'] += time.perf_counter() - read_started
                 if not data:
                     break
                 pending.extend(data)
@@ -534,7 +571,10 @@ def enumerate_mft(
     finally:
         kernel32.CloseHandle(handle)
 
+    reconcile_started = time.perf_counter()
     skipped += _complete_mft_records(records, record_details, extensions, cancelled)
+    if timings is not None:
+        timings['links_and_extensions_seconds'] = time.perf_counter() - reconcile_started
 
     if progress:
         progress(len(records))

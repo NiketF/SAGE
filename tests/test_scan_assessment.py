@@ -46,7 +46,8 @@ class ScanAssessmentTests(unittest.TestCase):
             BytesPerFileRecordSegment=1024, MftValidDataLength=len(data), MftStartLcn=1)
         kernel = Mock()
         kernel.CreateFileW.return_value = 1
-        with patch('sage.platform.windows.mft._kernel32', return_value=kernel), \
+        with patch.dict('os.environ', {'SAGE_MFT_PARSER':'python'}), \
+             patch('sage.platform.windows.mft._kernel32', return_value=kernel), \
              patch('sage.platform.windows.mft._volume_data', return_value=geometry), \
              patch('sage.platform.windows.mft._mft_data_runs', return_value=[(1, 9)]), \
              patch('sage.platform.windows.mft.apply_mft_fixup', return_value=True), \

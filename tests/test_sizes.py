@@ -15,6 +15,16 @@ from sage.services.scanner import analyze_sizes, scan_ntfs
 
 
 class SizeCollectionTests(unittest.TestCase):
+    def test_scan_keeps_missing_size_fallback(self):
+        records = {5:FileRecord(5,5,'.',FILE_ATTRIBUTE_DIRECTORY),
+                   11:FileRecord(11,5,'pending.bin',0)}
+        with patch('sage.services.scanner.get_volume_info',return_value=VolumeInfo('C:','','NTFS')), \
+             patch('sage.services.scanner.enumerate_mft',return_value=(records,0)):
+            result = scan_ntfs('C:')
+        self.assertFalse(result.sizes_complete)
+        self.assertEqual(result.directory_sizes,{})
+        self.assertEqual(result.root_stats,(1,1,0))
+
     def test_updates_file_and_folder_sizes_while_collecting(self):
         records = {
             5: FileRecord(5, 5, ".", FILE_ATTRIBUTE_DIRECTORY),
