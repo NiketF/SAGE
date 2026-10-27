@@ -1,261 +1,203 @@
-# SAGE
+<div align="center">
 
-SAGE (Storage Analysis and Guidance Engine) is a Windows-only NTFS storage
-prototype. It reads `$MFT` sequentially from the volume (the same approach as
-WizTree): names, parents, and logical/allocated sizes come from one pass, so
-the tree is usable with sizes as soon as the MFT scan finishes. After that
-scan of C:, the assistant retains its specific rule-matched cleanup list,
-with manual confirmation buttons in the chat. The right pane also uses a
-local model (`qwen3.5:4b`) for conversational, scan-grounded questions. No API key or
-cloud service is required.
+![SAGE — see your storage, understand your next move](docs/assets/sage-hero.svg)
 
-The prominent bar beneath the scan controls shows estimated `$MFT` read
-progress, then tree-building activity. Folder and file icons distinguish items
-in the tree. Size columns are filled from the MFT records; a directory-walk
-size pass runs only if a record had no `$DATA` size.
+**A fast Windows storage explorer with an AI assistant that runs locally.**
 
-## Requirements
+Find what occupies your drive. Explore the files behind the numbers. Ask what they do—and what removing them could change.
 
-- Windows 10 or 11
-- Python 3.11 or newer
-- An NTFS fixed drive
-- Administrator approval for raw volume access
+[**Download source**](https://github.com/NiketF/SAGE/archive/refs/heads/main.zip) · [**Quick start**](#quick-start) · [**The workflow**](#the-sage-workflow) · [**Performance**](#measured-performance)
 
-The runtime and automated tests use only the Python standard library.
-Conversational answers additionally need Ollama running locally with
-`qwen3.5:4b` downloaded. Scanning and basic evidence answers still work if
-Ollama is unavailable.
+Windows 10 / 11 · NTFS fixed drives · Python + C · Local AI through Ollama
 
-## Cleanup suggestions and permanent delete
+</div>
 
-When a scan finishes, the assistant lists specific items that are safe to
-delete on that drive, with exact paths and sizes, largest first. Only items
-over 20 MB that match known rules are listed: Windows Update and Delivery
-Optimization caches, Windows and user temp folders, crash dumps and error
-reports, browser and Electron app caches (Chrome, Edge, Brave, Firefox,
-Discord, Teams, VS Code, â€¦), GPU shader caches, pip/npm/Yarn/NuGet/Gradle/Go
-caches, project `node_modules` folders (only beside a `package.json`, never
-inside installed apps, `AppData`, or `resources` folders), installers (`.exe`, `.msi`, `.msix`, `.iso`) in
-Downloads, the Recycle Bin, and `Windows.old` upgrade leftovers. Documents,
-photos, Program Files, and generic AppData folders are not listed. Nested
-matches are collapsed so the same space is never counted twice.
+---
 
-Each item has a button directly in the chat. Pressing it asks for confirmation,
-then deletes **permanently** (no Recycle Bin). Cache folders keep the folder and
-delete its contents; files that are in use are skipped and reported. The
-Recycle Bin item empties the bin through Windows. The drive is rescanned
-afterward. Delete buttons only ever come from these rules; a model reply can
-add a button only for a path that is already in the verified list.
+## Less guessing. More understanding.
 
-The existing C: cleanup list and its manual confirmation buttons are retained.
-The conversational assistant can inspect these candidates and explain their
-conditions, but it never creates delete buttons or performs file operations.
-Questions are interpreted by the model using the selection, recent conversation,
-and validated evidence tools, rather than a phrase-specific reply dispatcher.
+A large folder tells you where your storage went. It does not tell you what the folder does or what you would lose by removing it.
 
-The conversation can review files, folders, and subfolders beyond rule-matched
-caches. Finding no rule candidate does not mean nothing can be reviewed or
-removed. Personal files need review; application and project dependencies need
-evidence. Advice does not create a delete button.
+**SAGE brings the file tree and the conversation together.** Its Storage Analysis and Guidance Engine reads NTFS metadata, builds a navigable drive tree, and gives the assistant access to evidence from that scan.
 
-SAGE marks Windows and application locations as protected for cleanup advice,
-except the specific caches in the verified cleanup list. Unknown paths are
-review candidates, not confirmed safe deletions. Every deletion requires the
-user to press a button and confirm.
+- **Find the space:** browse logical sizes, allocated space, file counts and folder totals.
+- **Understand the item:** select a file or folder and ask about its role, contents or removal options.
+- **Keep the context:** continue the conversation with the selected item, recent questions and retrieved scan evidence.
+- **Stay in control:** use explicit file actions and review cleanup suggestions before confirming a destructive operation.
 
-## Local conversational AI
+SAGE is an **actively developed source preview**. The download above contains the project source, not a one-click Windows installer.
 
-The UI uses `services/conversation.py` (`DriveAssistant`). Qwen interprets the
-question with recent conversation, selected items, and previous results. It can
-choose validated read-only tools to inspect a path, search names or metadata,
-list children, search approved text, find references, and identify possible
-duplicates. There is no phrase-specific dispatcher in this UI conversation path.
-The older `local_ai.ConversationAssistant` remains for legacy callers and tests.
+## The SAGE workflow
 
-Qwen writes the description and assessment in its own words; SAGE places the
-description first without supplying canned role sentences. SAGE supplies exact sizes,
-counts, and modification dates through `report_fact`; the model chooses that
-operation from the meaning of the question. Advice requests continue through
-the explanation flow rather than stopping at a supporting measurement.
-Ambiguous subjects should receive a question, not an assumed path.
+### 01 — Scan your drive
 
-Selected and explicitly named items receive a bounded tree inspection before
-the model answers. This includes nested file-type counts, example file and
-subfolder paths, retained attributes, unknown measurements and scan totals.
-It uses the retained MFT tree without opening descendant files. Reparse-point
-targets are not followed. A file also receives its surrounding folder context.
-Search-discovered items are inspected before the next answer (up to four per
-result, with incomplete coverage marked). This does not require another model
-call. The same evidence supports deletion, editing, updates, replacement,
-moving, renaming and other change questions; the model interprets the action.
+Choose an NTFS drive and start a scan. SAGE reads the Master File Table directly instead of opening every folder for its initial scan. A compiled C batch parser handles record processing when available.
 
-Tree work is bounded to 20,000 records or approximately 100 milliseconds per
-item and cached for repeated questions. Large trees, links and inconsistent
-records are explicitly marked partial. Summary samples are not a complete
-file listing, and inspection cannot establish live use, backups, application
-dependencies, effective permissions or deletion safety. The response instructions
-require purpose first, action-specific consequences and an appropriate next step
-or alternative. Model-written reasoning still needs quality evaluation.
+The tree appears with the retained file metadata and calculated folder totals. Local search indexing runs in the background; on C:, cleanup suggestions are prepared separately so their calculation does not hold up tree interaction.
 
-Ollama and `qwen3.5:4b` must be installed separately. All model communication
-uses `127.0.0.1:11434`. Drive data and the SQLite index remain local. No cloud
-API, API key, new runtime package, or model training is required.
+### 02 — Explore what occupies the space
 
-### Scan and indexing
+Expand folders, change the sort order and inspect individual items. The tree shows file size, attributed disk allocation, item counts and file attributes.
 
-The tree is displayed without waiting for SQLite or content indexing. Indexing
-runs in a cancellable background worker with progress. It replaces removed scan
-paths, reuses unchanged excerpts, and closes database connections explicitly.
-Searches can use bounded current-scan metadata while indexing is still running.
+Right-click to open an item, reveal it in Explorer, copy its path, copy or move it, rename it, or send it to the Recycle Bin. Drive roots have additional restrictions.
 
-Approved text excerpts have a 128 KiB file limit and at most eight 500-character
-chunks per file. Background text work has a two-second budget per scan update;
-this is partial coverage, not an exhaustive content audit. Sensitive locations,
-unapproved formats, binary files, offline items, and linked paths are excluded.
-The indexing API supports include/exclude paths. It never executes a file.
-If indexed text has no match, a targeted search can check up to 64 approved small
-files within a further one-second budget. This also has partial coverage.
-Item evidence includes nearby parent and sibling names from the scan to help
-explain context; nearby names do not confirm application ownership.
-PDF and Office content adapters and embeddings are not included.
+### 03 — Ask SAGE
 
-Content hits describe indexed text, not proof that a program currently uses a
-file. A missing hit does not prove a file is unreferenced. Duplicate candidates
-share a measured size; their contents are not compared. These limits remain in
-the tool evidence and response safeguards.
+Select an item and use **Ask SAGE**, or type a question in the assistant pane:
 
-### Responsiveness and safety
+> Which folders use the most space on this drive?
+>
+> What is this folder used for?
+>
+> Can I remove this application, and what features would I lose?
+>
+> Find large ZIP files on this drive.
+>
+> What can I clean up on C:?
 
-The model is prepared in the background and kept warm for 30 minutes. A cold
-or unavailable model returns useful scan facts rather than queuing a long
-answer. Fifteen seconds is a performance target, not a cancellation point.
-There is a 30-second request ceiling, short adaptive output limits, at most two
-tool rounds, and no extended reasoning mode. Local disk access can still vary
-in duration. The HTTP deadline disconnects slow streams, and rescan cancels the
-old conversation's active connection.
+The assistant can retrieve metadata, inspect bounded parts of the hierarchy and search eligible local text. Follow-up questions use recent conversation context. For repeated filenames, select the exact item or provide its full path.
 
-Complete sentences stream into the panel after path checks. The final answer replaces
-the provisional stream. Replies cut by the output limit are labelled partial,
-with an option to continue the conversation. On a small model, a partial answer
-may omit some requested explanation; it is not a verified full assessment.
+### 04 — Review, then act
 
-The new conversation cannot perform delete, move, rename, or modification
-operations and creates no operation buttons. The separate C: policy remains
-extensible; the existing C: suggestion list and manual tree operations retain
-their established safeguards. Whole-C-drive cleanup advice uses existing rule
-candidates. The model does not receive file-changing tools.
+SAGE distinguishes system-managed items, application-removal options, managed cleanup, personal data and items that need more evidence. Explanations aim to cover purpose, consequences, conditions and an appropriate removal method.
 
-Language targets short, direct, STE-inspired sentences. This is not formal
-ASD-STE100 certification. Model-written explanations still require evaluation;
-path checks and read-only tools cannot prove every natural-language conclusion.
+C: cleanup suggestions come from existing rules, with paths and sizes. Suggested categories include selected caches, temporary files, crash reports, development caches and some downloaded installers. A location match is a candidate for review—not a universal safety guarantee.
 
-Run current response checks and local-model trials from the project directory:
+> [!WARNING]
+> **Cleanup buttons can delete permanently after confirmation.** They do not send items to the Recycle Bin. Tree recycle actions are separate. Review the exact path and consequences before confirming.
+
+The chat model has read-only tools. It does not independently delete, move or edit your files. File-changing controls remain separate, and file operations trigger a fresh scan to update the displayed evidence.
+
+## Measured performance
+
+**981,208 records processed in a 7.12-second C: scan.**
+
+Measured locally on an **Intel Core i7-7700HQ**, **16 GB RAM**, with C: on a **Samsung SSD**:
+
+- **Scanner completion:** 36.33 → **7.12 seconds** — **80.4% less time**, approximately **5.1× faster**.
+- **Scan to first interface idle:** 42.88 → **7.47 seconds** — **82.6% less time**.
+- **MFT record parsing:** 26.72 → **2.30 seconds** — approximately **11.6× faster**.
+- **Cleanup suggestions ready:** **11.92 seconds** from scan start, calculated in the background.
+- **Latest measured scan:** **981,208 records**, with **3,688 skipped records**.
+
+These are individual local measurements, not controlled identical-data benchmarks. Drive contents changed between runs. Results vary with hardware, MFT size, caching and system activity. First interface idle is a responsiveness proxy, not a direct screen-paint measurement. Scan timings are not AI response-time promises.
+
+The current improvements reduce parser allocations and block copies, use a C batch parser, and combine count and size aggregation into one pass. See [parser implementation notes](scripts/C-PARSER.md).
+
+## Quick start
+
+### What you need
+
+- Windows 10 or 11 and an NTFS fixed drive.
+- Administrator approval for raw volume access.
+- **64-bit Python 3.11** to use the included compiled parser.
+- Optional: [Ollama for Windows](https://ollama.com/download/windows) and the `qwen3.5:4b` model for conversational AI.
+
+Python 3.11 or newer can run the source application. Other Python versions need a matching compiled-parser build for the fast path; the Python parser remains available. The included binary targets **CPython 3.11 / Windows x64**.
+
+### Get the source and launch
+
+Download and extract the [source ZIP](https://github.com/NiketF/SAGE/archive/refs/heads/main.zip), open PowerShell in the extracted folder, and run:
+
+```powershell
+python -B .\run_sage.py
+```
+
+Or clone the repository:
+
+```powershell
+git clone https://github.com/NiketF/SAGE.git
+cd SAGE
+python -B .\run_sage.py
+```
+
+Approve the administrator prompt, select a drive, and scan. The default parser selection uses the compiled component when it is installed and the Python parser when it is absent. The standard source launch does not require installing a Python package.
+
+### Enable the local AI assistant
+
+Install [Ollama](https://ollama.com/download/windows), then download SAGE's configured model:
+
+```powershell
+ollama pull qwen3.5:4b
+```
+
+Keep Ollama available and launch SAGE. Model preparation happens in the background. Scanning and deterministic evidence features remain available without conversational AI.
+
+The model download needs internet access. Local inference speed depends on model readiness and CPU/GPU resources. The model is installed separately from SAGE; see the [model page](https://ollama.com/library/qwen3.5).
+
+## Local by design
+
+SAGE's current AI client communicates with Ollama at `127.0.0.1:11434`. There is no integrated cloud AI API or API-key requirement.
+
+The local SQLite index stores scan metadata and limited excerpts from eligible text files. MFT scanning itself does not read every file's contents. Text indexing is bounded by format, size, time and location rules; it is not a complete content audit.
+
+## Know the boundaries
+
+SAGE helps you investigate and decide. It does not establish every application's dependencies or know which personal files matter to you.
+
+- **Scan coverage:** skipped records and live filesystem changes can affect results. A missing search hit is not proof that a file does not exist.
+- **Space accounting:** logical size, attributed allocation and recoverable space differ. Allocated totals still need validation on some volumes; a scan total is not a promise of space that deletion will recover.
+- **Hard links:** multiple paths can share physical storage. Removing one path may free no file data.
+- **Duplicate candidates:** equal measured sizes identify possibilities. File contents are not compared to prove duplicates.
+- **AI coverage:** retrieved hierarchy samples and text searches can be partial. PDF/Office content adapters and embeddings are not included. Treat explanations as assistance, not permission to delete.
+- **NTFS support:** this preview does not provide deleted-file forensics or network/non-NTFS scanning. MFT layouts requiring additional mapping records beyond the supported root mapping are rejected rather than reported as complete.
+
+<details>
+<summary><strong>Under the hood: the scan and assistant pipeline</strong></summary>
+
+```text
+NTFS drive
+  → Existing raw MFT reader
+  → C batch parser, or Python compatibility parser
+  → Hard-link and extension-record reconciliation
+  → Parent–child hierarchy + combined counts and sizes
+  → Interactive file tree
+      ├─ Background local search indexing
+      ├─ Background C: cleanup preparation
+      └─ Selected item / question
+          → Validated read-only evidence tools
+          → Local Ollama model
+          → Streamed explanation
+```
+
+Python coordinates the application and retains the existing `ScanResult` contract. The C extension accelerates record processing. Tk updates stay on the main thread; worker results are checked against the active scan so stale results cannot replace a newer drive's view.
+
+Relevant code: [MFT reader](src/sage/platform/windows/mft.py), [C parser](src/sage/platform/windows/_mft_fast.c), [hierarchy](src/sage/services/hierarchy.py), [conversation](src/sage/services/conversation.py), [tool validation](src/sage/services/tool_registry.py), and [cleanup rules](src/sage/services/cleanup.py).
+
+</details>
+
+<details>
+<summary><strong>Development, validation and timing</strong></summary>
+
+Run the checks from the repository root:
 
 ```powershell
 $env:PYTHONPATH = 'src;tests'
-python -B -m unittest test_drive_conversation -v
-python -B scripts/evaluate_drive_conversation.py --warm --output conversation-review
+python -B -m unittest discover -s tests
 ```
 
-The trial uses synthetic scan records and synthetic approved text. It does not
-scan personal files. JSON preserves timings and tool results; RESPONSES.md
-shows actual replies and marks partial/fallback outcomes. The older
-`evaluate_local_ai.py` and `benchmark_local_ai.py` exercise the legacy service.
+The latest optimization was checked with **233 automated tests**. Compiled-parser checks need the matching extension installed. Automated checks support, rather than replace, validation in the real application.
 
-## Run from source
-
-The quickest route needs no installation:
+Capture a local timing report with an explicit parser selection:
 
 ```powershell
-python run_sage.py
+python -B .\run_sage.py --scan-timings --mft-parser=c
 ```
 
-To install the optional `sage` command instead:
+Use `--mft-parser=python` for comparison. Timings are saved locally to `%LOCALAPPDATA%\SAGE\scan-timing-last.json`. Check the active parser, record count and skipped records alongside duration. See [timing definitions](scripts/SCAN-TIMING.md) and [compiled-parser build instructions](scripts/C-PARSER.md).
 
-```powershell
-python -m pip install -e .
-sage
-```
+</details>
 
-SAGE requests UAC elevation on launch. A cancelled UAC prompt ends the launch.
+## Help improve SAGE
 
-## Validate
+Found a scan mismatch, an unclear answer or a performance issue? [Open an issue](https://github.com/NiketF/SAGE/issues) with your Windows version, app revision, parser selection and anonymized timings. For AI issues, include a reproducible question and expected behavior without sharing private files.
 
-```powershell
-python -m compileall -q src tests
-$env:PYTHONPATH = "src"
-python -m unittest discover -s tests -v
-```
+---
 
-## Architecture
+<div align="center">
 
-- `platform/windows/mft.py` reads `$MFT` from the raw volume, applies the
-  NTFS update-sequence fixup, and parses FILE records for names, parents,
-  unnamed `$DATA` sizes, modified time, and attributes. Only junctions and
-  symlinks keep the link attribute; OneDrive placeholders and compressed files
-  do not.
-- `platform/windows/file_operations.py` handles Windows Shell copy/move/rename
-  and Recycle Bin actions, plus permanent delete and emptying the Recycle Bin
-  from chat cleanup buttons.
-- `services/hierarchy.py` reconstructs parents and aggregates counts and folder
-  totals in memory.
-- `platform/windows/sizes.py` is the fallback directory-walk size collector,
-  used only when MFT records did not already supply sizes.
-- `services/cleanup.py` holds the cleanup rules and builds the specific
-  safe-to-delete list from the finished scan.
-- `services/evidence.py` produces deterministic fallback answers.
-- `services/retrieval.py` retrieves bounded scan evidence and cleanup-risk labels.
-- `services/local_database.py` stores the persistent local SQLite metadata/content
-  index used by conversational retrieval.
-- `services/tool_registry.py` validates and executes approved read-only assistant
-  tools (`search_names`, `search_content`, `inspect_path`, `list_children`,
-  `summarize_folder`, `find_large_files`, `retrieve_context`, `impact_analysis`).
-- `services/action_policy.py` applies drive-aware read-only action policy
-  (including stricter `C:` policy tier).
-- `services/profile.py` builds the per-item profile: scan metadata, owning
-  installed app, program version information, and download source.
-- `services/known_folders.py` is the knowledge list of well-known Windows
-  locations and their supported cleanup routes.
-- `services/conversation.py` is the active model-led UI conversation, bounded
-  retrieval loop, memory, response checks, and streaming decoder.
-- `services/local_ai.py` contains the deadline/cancellation-aware Ollama client
-  and the earlier conversation service for compatibility.
-- `ui/assistant_panel.py` renders chat replies and embeds a delete button per
-  verified cleanup item.
-- `ui/markdown.py` converts assistant formatting into native Tk text styles.
-- `ui/` contains the two-pane Tkinter interface and background-job coordinator.
+**See the space. Ask the question. Make an informed choice.**
 
-The scan coordinator assigns every scan a generation number and cancels older
-workers. UI updates travel through a queue owned by the Tk main thread, so stale
-results from a previous drive cannot replace a newer scan.
+[**Get the SAGE source**](https://github.com/NiketF/SAGE/archive/refs/heads/main.zip) · [Explore the code](https://github.com/NiketF/SAGE) · [Report an issue](https://github.com/NiketF/SAGE/issues)
 
-## Working with files
-
-Right-click a file or folder in the left tree. SAGE can open it, reveal it in
-Explorer, copy its path, copy or cut and paste within the tree, copy or move it
-to a chosen folder, rename it, or send it to the Recycle Bin. Keyboard shortcuts
-include Ctrl+C, Ctrl+X, Ctrl+V, F2, and Delete. Verified cleanup items in the
-assistant pane can be deleted permanently after confirmation. File changes
-trigger a fresh scan so the displayed evidence stays current. The drive root
-cannot be moved, renamed, or recycled from the tree. Recycle and permanent
-delete actions require confirmation.
-
-## Prototype boundaries
-
-- The hierarchy scan is MFT-backed and never falls back to `os.walk()`.
-- File sizes are taken from unnamed `$DATA` on each in-use MFT record during
-  the sequential `$MFT` read. Folder totals are summed in memory afterward.
-  A Windows directory metadata walk remains only as fallback for records that
-  had no MFT size. Scanning is I/O-bound on `$MFT` (typically hundreds of MB),
-  not on opening every folder on the volume. Python is still slower than a
-  native C++ tool such as WizTree, but it no longer scales with directory-walk
-  syscalls. `$MFT` mapping pairs are read from record 0; volumes that store
-  those runs only in `$ATTRIBUTE_LIST` are not handled.
-- Folder allocation totals sum contained files. NTFS directory metadata overhead
-  is not included.
-- Active MFT records are analyzed. Deleted-record forensics, alternate data
-  streams, hard-link name expansion, and content-verified duplicate detection are still out of
-  scope. Conversational indexing is local-only, read-only, and bounded by file
-  type, size limits, and safety exclusions.
-- Live filesystems can change during a scan, so a small number of unreadable
-  paths is expected and reported rather than treated as a fatal error.
+</div>
