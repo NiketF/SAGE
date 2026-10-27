@@ -596,7 +596,9 @@ def enumerate_mft(
         kernel32.CloseHandle(handle)
 
     reconcile_started = time.perf_counter()
-    skipped += _complete_mft_records(records, record_details, extensions, cancelled)
+    # Healthy drives rarely produce multi-name/extension entries; skip the O(N) walk when nothing to merge.
+    if record_details or extensions:
+        skipped += _complete_mft_records(records, record_details, extensions, cancelled)
     if timings is not None:
         timings['links_and_extensions_seconds'] = time.perf_counter() - reconcile_started
 
