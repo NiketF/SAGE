@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import queue
 import struct
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from ctypes import wintypes
@@ -556,39 +558,85 @@ def enumerate_mft(
                     progress_details(len(records), fraction)
                 last_reported = len(records)
 
-        for lcn, cluster_count in runs:
-            if cancelled and cancelled():
-                raise InterruptedError("MFT scan cancelled.")
-            run_bytes = cluster_count * cluster
-            take = min(run_bytes, max(0, valid - bytes_seen))
-            if take <= 0:
-                break
-            if lcn < 0:
-                consume_pending()
-                pending.clear()
-                record_index += take // record_size
-                bytes_seen += take
-                continue
-            disk_offset = lcn * cluster
-            remaining = take
-            while remaining > 0:
+        # Pipelined read: a reader thread pre-fetches the next MFT chunk while
+        # the main thread parses the current one. ctypes releases the GIL inside
+        # ReadFile, so disk I/O overlaps with parsing. The handle is only touched
+        # by one thread at a time (reader until it stops; main for CloseHandle).
+        # ponytail: queue depth 2 is enough to hide one read latency; larger
+        # just inflates peak RAM. Upgrade path if needed: full OVERLAPPED I/O.
+        read_queue: queue.Queue = queue.Queue(maxsize=2)
+        stop_flag = threading.Event()
+        reader_error: list[BaseException] = []
+
+        def _reader() -> None:
+            try:
+                queued = 0
+                for lcn, cluster_count in runs:
+                    if stop_flag.is_set() or (cancelled and cancelled()):
+                        return
+                    run_bytes = cluster_count * cluster
+                    take = min(run_bytes, max(0, valid - queued))
+                    if take <= 0:
+                        return
+                    if lcn < 0:
+                        read_queue.put(('sparse', take, 0.0))
+                        queued += take
+                        continue
+                    disk_off = lcn * cluster
+                    remaining = take
+                    while remaining > 0:
+                        if stop_flag.is_set() or (cancelled and cancelled()):
+                            return
+                        want = min(remaining, MFT_BUFFER_SIZE)
+                        t0 = time.perf_counter()
+                        data = _read_at(kernel32, handle, disk_off, want, sector)
+                        dt = time.perf_counter() - t0
+                        if not data:
+                            return
+                        read_queue.put(('data', data, dt))
+                        disk_off += len(data)
+                        remaining -= len(data)
+                        queued += len(data)
+            except BaseException as exc:
+                reader_error.append(exc)
+            finally:
+                read_queue.put(('end', None, 0.0))
+
+        reader_thread = threading.Thread(target=_reader, name='sage-mft-reader', daemon=True)
+        reader_thread.start()
+        try:
+            while True:
+                kind, payload, dt = read_queue.get()
+                if kind == 'end':
+                    break
                 if cancelled and cancelled():
                     raise InterruptedError("MFT scan cancelled.")
-                chunk = min(remaining, MFT_BUFFER_SIZE)
-                read_started = time.perf_counter()
-                data = _read_at(kernel32, handle, disk_offset, chunk, sector)
+                if kind == 'sparse':
+                    consume_pending()
+                    pending.clear()
+                    record_index += payload // record_size
+                    bytes_seen += payload
+                    continue
+                # kind == 'data'
                 if timings is not None:
-                    timings['mft_read_seconds'] += time.perf_counter() - read_started
-                if not data:
-                    break
+                    timings['mft_read_seconds'] += dt
                 if not pending:
-                    pending = data if isinstance(data, bytearray) else bytearray(data)
+                    pending = payload if isinstance(payload, bytearray) else bytearray(payload)
                 else:
-                    pending.extend(data)
-                disk_offset += len(data)
-                remaining -= len(data)
-                bytes_seen += len(data)
+                    pending.extend(payload)
+                bytes_seen += len(payload)
                 consume_pending()
+        finally:
+            stop_flag.set()
+            # Drain queue so the reader can push its final sentinel and exit.
+            while reader_thread.is_alive():
+                try:
+                    read_queue.get(timeout=0.1)
+                except queue.Empty:
+                    pass
+            reader_thread.join(timeout=5.0)
+        if reader_error:
+            raise reader_error[0]
         consume_pending()
         if bytes_seen < valid:
             raise OSError("$MFT read ended before its valid length; scan is incomplete.")
