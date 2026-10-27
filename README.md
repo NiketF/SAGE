@@ -1,6 +1,8 @@
-<div align="center">
+<p align="center">
+  <img src="https://github.com/NiketF/SAGE/blob/main/SAGE_Banner.jpeg?raw=true" alt="SAGE Banner" width="100%">
+</p>
 
-![SAGE — see your storage, understand your next move](docs/assets/sage-hero.svg)
+<div align="center">
 
 **A fast Windows storage explorer with an AI assistant that runs locally.**
 
