@@ -1,0 +1,57 @@
+name: Build MFT fast parser
+
+# Builds the optional C parser (_mft_fast) for every supported CPython version
+# on Windows x64 and uploads the .pyd files as release/workflow artifacts so
+# users on 3.10 / 3.12 / 3.13 are not silently forced onto the ~15x slower
+# pure-Python fallback.
+
+on:
+  push:
+    branches: [main, sahill]
+    paths:
+      - 'src/sage/platform/windows/_mft_fast.c'
+      - 'scripts/build_mft_parser.py'
+      - '.github/workflows/build-mft-parser.yml'
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build _mft_fast (Python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }} (x64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: x64
+
+      - name: Show interpreter info
+        shell: pwsh
+        run: |
+          python -c "import sys, sysconfig, struct; print('version', sys.version); print('bits', struct.calcsize('P') * 8); print('ext_suffix', sysconfig.get_config_var('EXT_SUFFIX'))"
+
+      - name: Build _mft_fast
+        shell: pwsh
+        run: |
+          python scripts/build_mft_parser.py
+
+      - name: List built artifact
+        shell: pwsh
+        run: |
+          Get-ChildItem src/sage/platform/windows/_mft_fast*.pyd
+
+      - name: Upload _mft_fast.pyd
+        uses: actions/upload-artifact@v4
+        with:
+          name: _mft_fast-py${{ matrix.python-version }}-win_amd64
+          path: src/sage/platform/windows/_mft_fast*.pyd
+          if-no-files-found: error

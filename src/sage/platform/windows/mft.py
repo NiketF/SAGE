@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import os
 import struct
+import sys
 import time
 from collections.abc import Callable, Iterator
 from ctypes import wintypes
@@ -394,6 +395,17 @@ def _mft_data_runs(record: bytearray) -> list[tuple[int, int]]:
     return parsed_runs
 
 
+def _warn_c_parser_missing() -> None:
+    # pure-Python fallback is ~10-30x slower; make the slowdown loud, not silent.
+    tag = f"cp{sys.version_info.major}{sys.version_info.minor}-win_amd64"
+    print(
+        f"SAGE: compiled MFT parser (_mft_fast) not installed for this "
+        f"interpreter (expected tag '{tag}'); using pure-Python parser "
+        f"(~10-30x slower). Run scripts/build_mft_parser.py to restore speed.",
+        file=sys.stderr, flush=True,
+    )
+
+
 def enumerate_mft(
     drive: str,
     progress: Callable[[int], None] | None = None,
@@ -414,6 +426,7 @@ def enumerate_mft(
             import importlib.util
             if importlib.util.find_spec(__package__ + '._mft_fast') is not None or parser_choice == 'c':
                 raise
+            _warn_c_parser_missing()
         else:
             if _mft_fast.PARSER_VERSION != 1:
                 raise RuntimeError('Compiled MFT parser version mismatch.')
