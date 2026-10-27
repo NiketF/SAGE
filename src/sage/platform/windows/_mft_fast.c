@@ -30,11 +30,18 @@ typedef struct {
     uint16_t sequence,links;
     int directory,attribute_list;
     PyObject *name,*names,*streams,*logical,*allocated;
+    PyObject *first_name;
+    uint64_t first_parent,stream_logical,stream_allocated;
+    uint32_t stream_kind;
+    const unsigned char *stream_name;
+    size_t stream_name_length;
+    int has_stream;
 } Parsed;
 
 static void clear_parsed(Parsed *p) {
     Py_XDECREF(p->name); Py_XDECREF(p->names); Py_XDECREF(p->streams);
     Py_XDECREF(p->logical); Py_XDECREF(p->allocated);
+    Py_XDECREF(p->first_name);
 }
 
 /* Returns 1 for sizes, 0 for a continuation/short attribute. */
@@ -51,7 +58,7 @@ static int sizes(const unsigned char *a,size_t n,uint64_t *logical,uint64_t *all
     return 1;
 }
 
-static int add_stream(Parsed *p,uint32_t kind,const unsigned char *name,size_t length,
+static int set_stream(Parsed *p,uint32_t kind,const unsigned char *name,size_t length,
                       uint64_t logical,uint64_t allocated) {
     PyObject *key=Py_BuildValue("(Iy#)",kind,(const char *)name,(Py_ssize_t)length);
     PyObject *value=Py_BuildValue("(KK)",(unsigned long long)logical,(unsigned long long)allocated);
@@ -60,14 +67,65 @@ static int add_stream(Parsed *p,uint32_t kind,const unsigned char *name,size_t l
     Py_DECREF(key); Py_DECREF(value); return result;
 }
 
+static int materialize_streams(Parsed *p) {
+    if(p->streams) return 0;
+    p->streams=PyDict_New();
+    if(!p->streams) return -1;
+    return p->has_stream ? set_stream(p,p->stream_kind,p->stream_name,p->stream_name_length,
+                                      p->stream_logical,p->stream_allocated) : 0;
+}
+
+static int add_stream(Parsed *p,uint32_t kind,const unsigned char *name,size_t length,
+                      uint64_t logical,uint64_t allocated) {
+    /* Keep a single stream in C fields; materialize only for multiple streams
+       or retained extension/link details. The input block stays pinned. */
+    if(!p->streams && (!p->has_stream || (kind==p->stream_kind && length==p->stream_name_length &&
+            (!length || memcmp(name,p->stream_name,length)==0)))) {
+        p->has_stream=1; p->stream_kind=kind; p->stream_name=name; p->stream_name_length=length;
+        p->stream_logical=logical; p->stream_allocated=allocated;
+        return 0;
+    }
+    if(materialize_streams(p)<0) return -1;
+    return set_stream(p,kind,name,length,logical,allocated);
+}
+
+static int materialize_names(Parsed *p) {
+    if(p->names) return 0;
+    p->names=PyList_New(0);
+    if(!p->names) return -1;
+    if(p->first_name) {
+        PyObject *pair=Py_BuildValue("(KO)",(unsigned long long)p->first_parent,p->first_name);
+        if(!pair) return -1;
+        int status=PyList_Append(p->names,pair); Py_DECREF(pair); return status;
+    }
+    return 0;
+}
+
+static int add_name(Parsed *p,uint64_t parent,PyObject *name) {
+    if(!p->first_name && !p->names) {
+        p->first_parent=parent; p->first_name=Py_NewRef(name); return 0;
+    }
+    if(!p->names && parent==p->first_parent) {
+        int equal=PyObject_RichCompareBool(name,p->first_name,Py_EQ);
+        if(equal<0) return -1;
+        if(equal) return 0;
+    }
+    if(materialize_names(p)<0) return -1;
+    PyObject *pair=Py_BuildValue("(KO)",(unsigned long long)parent,name);
+    if(!pair) return -1;
+    int present=PySequence_Contains(p->names,pair);
+    int status=present<0 || (!present && PyList_Append(p->names,pair)<0) ? -1 : 0;
+    Py_DECREF(pair); return status;
+}
+
 /* 1=parsed, 0=invalid record, -1=Python exception. All offsets are checked. */
 static int parse(const unsigned char *d,size_t n,Parsed *p) {
     if(n<0x30 || memcmp(d,"FILE",4)!=0 || !(r16(d+0x16)&1)) return 0;
     p->sequence=r16(d+0x10); p->base=r64(d+0x20);
     p->directory=!!(r16(d+0x16)&2); p->links=r16(d+0x12);
     if(!p->links) p->links=1;
-    p->name=PyUnicode_New(0,0); p->names=PyList_New(0); p->streams=PyDict_New();
-    if(!p->name || !p->names || !p->streams) return -1;
+    p->name=PyUnicode_New(0,0);
+    if(!p->name) return -1;
     size_t limit=r32(d+0x18); if(limit>n) limit=n;
     size_t offset=r16(d+0x14);
     int rank=-1,has_reparse=0;
@@ -109,12 +167,7 @@ static int parse(const unsigned char *d,size_t n,Parsed *p) {
                     if(PyUnicode_GET_LENGTH(name)) {
                         int candidate_rank=ns==3 ? 3 : ns==1 ? 2 : ns==0 ? 1 : 0;
                         if(candidate_rank>0) {
-                            PyObject *pair=Py_BuildValue("(KO)",(unsigned long long)parent,name);
-                            if(!pair) { Py_DECREF(name); return -1; }
-                            int present=PySequence_Contains(p->names,pair);
-                            int failed=present<0 || (!present && PyList_Append(p->names,pair)<0);
-                            Py_DECREF(pair);
-                            if(failed) { Py_DECREF(name); return -1; }
+                            if(add_name(p,parent,name)<0) { Py_DECREF(name); return -1; }
                         }
                         if(candidate_rank>rank) {
                             rank=candidate_rank; p->parent=parent;
@@ -135,6 +188,16 @@ static int parse(const unsigned char *d,size_t n,Parsed *p) {
     }
     if(has_reparse && !(reparse&0x20000000)) p->attributes&=~0x400u;
     if(p->directory) p->attributes|=0x10;
+    if(!p->streams) {
+        uint64_t logical=p->has_stream && p->stream_kind==0x80 && p->stream_name_length==0 ? p->stream_logical : 0;
+        p->logical=PyLong_FromUnsignedLongLong(logical);
+        p->allocated=PyLong_FromUnsignedLongLong(p->has_stream ? p->stream_allocated : 0);
+        if(!p->logical || !p->allocated) return -1;
+        if(p->base || p->attribute_list || p->names) {
+            if(materialize_names(p)<0 || materialize_streams(p)<0) return -1;
+        }
+        return 1;
+    }
     p->logical=PyLong_FromLong(0); p->allocated=PyLong_FromLong(0);
     if(!p->logical || !p->allocated) return -1;
     Py_ssize_t pos=0; PyObject *key,*value;
@@ -148,6 +211,7 @@ static int parse(const unsigned char *d,size_t n,Parsed *p) {
         }
         if(PyErr_Occurred()) return -1;
     }
+    if((p->base || p->attribute_list || p->names) && materialize_names(p)<0) return -1;
     return 1;
 }
 
@@ -187,7 +251,7 @@ static int store_record(PyObject *records,PyObject *details,PyObject *record_typ
     PyObject *args[]={id,parent,p->name,shared,p->logical,p->allocated,Py_None,Py_True,modified,Py_None,links};
     row=PyObject_Vectorcall(record_type,args,11,NULL);
     if(!row || PyDict_SetItem(records,id,row)<0) goto done;
-    if(PyList_GET_SIZE(p->names)>1 || p->attribute_list) {
+    if((p->names && PyList_GET_SIZE(p->names)>1) || p->attribute_list) {
         detail=Py_BuildValue("{s:O,s:O,s:O}","names",p->names,"streams",p->streams,
                              "attribute_list",p->attribute_list ? Py_True : Py_False);
         if(!detail || PyDict_SetItem(details,id,detail)<0) goto done;
@@ -242,5 +306,6 @@ static struct PyModuleDef module={PyModuleDef_HEAD_INIT,"_mft_fast",NULL,-1,meth
 PyMODINIT_FUNC PyInit__mft_fast(void) {
     PyObject *m=PyModule_Create(&module);
     if(m && PyModule_AddIntConstant(m,"PARSER_VERSION",1)<0) { Py_DECREF(m); return NULL; }
+    if(m && PyModule_AddIntConstant(m,"OPTIMIZATION_VERSION",2)<0) { Py_DECREF(m); return NULL; }
     return m;
 }

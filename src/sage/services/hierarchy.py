@@ -51,7 +51,7 @@ def build_scan_result(
         if record.frn == root_frn:
             continue
         parent = records.get(record.parent_frn)
-        if parent is None or not parent.is_directory or record.parent_frn == record.frn:
+        if parent is None or not parent.attributes & FILE_ATTRIBUTE_DIRECTORY or record.parent_frn == record.frn:
             record.parent_frn = root_frn
         children[record.parent_frn].append(record.frn)
 
@@ -70,6 +70,8 @@ def _directory_postorder(result: ScanResult) -> list[int]:
     order: list[int] = []
     stack: list[tuple[int, bool]] = [(result.root_frn, False)]
     entered: set[int] = set()
+    get_record = result.records.get
+    get_children = result.children.get
 
     while stack:
         frn, expanded = stack.pop()
@@ -80,9 +82,9 @@ def _directory_postorder(result: ScanResult) -> list[int]:
             continue
         entered.add(frn)
         stack.append((frn, True))
-        for child_frn in result.children.get(frn, ()):
-            child = result.records.get(child_frn)
-            if child and child.is_directory:
+        for child_frn in get_children(frn, ()):
+            child = get_record(child_frn)
+            if child and child.attributes & FILE_ATTRIBUTE_DIRECTORY:
                 stack.append((child_frn, False))
     return order
 
@@ -91,6 +93,8 @@ def calculate_stats(result: ScanResult, *, include_sizes: bool = False) -> dict[
     """Aggregate counts, and optionally ready sizes, in one bottom-up pass."""
     totals: dict[int, tuple[int, int, int]] = {}
     size_totals: dict[int, tuple[int, int]] = {}
+    get_record = result.records.get
+    get_children = result.children.get
     for frn in _directory_postorder(result):
         files = 0
         folders = 0
@@ -99,11 +103,11 @@ def calculate_stats(result: ScanResult, *, include_sizes: bool = False) -> dict[
         if include_sizes:
             own = result.records[frn]
             allocated = own.allocated_size if own.size_ready else 0
-        for child_frn in result.children.get(frn, ()):
-            child = result.records.get(child_frn)
+        for child_frn in get_children(frn, ()):
+            child = get_record(child_frn)
             if child is None:
                 continue
-            if child.is_directory:
+            if child.attributes & FILE_ATTRIBUTE_DIRECTORY:
                 child_items, child_files, child_folders = totals.get(child_frn, (0, 0, 0))
                 files += child_files
                 folders += child_folders + 1

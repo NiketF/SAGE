@@ -30,11 +30,13 @@ def snapshot(entries):
     for i,record in entries.items(): records[i]=protected(record)
     return b''.join(records)
 
-def replay(data,backend,chunk_size=4*1024*1024,progress=None):
+def replay(data,backend,chunk_size=4*1024*1024,progress=None,writable=False):
     geometry=SimpleNamespace(BytesPerSector=512,BytesPerCluster=1024,
         BytesPerFileRecordSegment=1024,MftValidDataLength=len(data),MftStartLcn=1)
     kernel=Mock();kernel.CreateFileW.return_value=1
     blocks=[data[i:i+chunk_size] for i in range(0,len(data),chunk_size)]
+    if writable:
+        blocks=[bytearray(block) for block in blocks]
     with patch.dict(os.environ,{'SAGE_MFT_PARSER':backend}), \
          patch.object(mft,'MFT_BUFFER_SIZE',chunk_size), \
          patch.object(mft,'_kernel32',return_value=kernel), \
@@ -123,5 +125,35 @@ class CompiledParserTests(unittest.TestCase):
             at=rng.randrange(0x38,300)
             block[at:at+4]=rng.randbytes(4)
             _mft_fast.parse_batch(block,1024,0,{},{},{},FileRecord,{})
+
+    def test_lazy_details_preserve_duplicate_streams_and_names(self):
+        self.compare(snapshot({
+            5:make_mft_record(pack_file_name('.',ROOT),flags=3),
+            6:make_mft_record(pack_file_name('same',ROOT),pack_file_name('same',ROOT,ns=3),
+                pack_nonresident_data(100,4096),pack_nonresident_data(200,8192)),
+            7:make_mft_record(pack_file_name('linked',ROOT),pack_file_name('other',ROOT),
+                named_data('extra',10,4096),named_data('extra',20,8192),pack_nonresident_data(30,4096)),
+            8:make_mft_record(pack_file_name('listed',ROOT),pack_resident_attr(0x20,b'')),
+            9:make_mft_record(named_data('extra',2,4096),base=(1<<48)|8),
+            10:make_mft_record(pack_file_name('DOS~1',ROOT,ns=2),pack_resident_attr(0x20,b''),pack_resident_data(12)),
+        }))
+
+    def test_lazy_stream_sum_keeps_python_integer_precision(self):
+        huge=(1<<63)-1
+        self.compare(snapshot({
+            5:make_mft_record(pack_file_name('.',ROOT),flags=3),
+            6:make_mft_record(pack_file_name('huge',ROOT),pack_nonresident_data(huge,huge),
+                named_data('a',huge,huge),named_data('b',huge,huge)),
+        }))
+
+    def test_owned_read_buffers_with_partial_records(self):
+        data=snapshot({5:make_mft_record(pack_file_name('.',ROOT),flags=3),
+            6:make_mft_record(pack_file_name('data',ROOT),pack_nonresident_data(10,4096)),
+            7:make_mft_record(pack_file_name('alias',ROOT),pack_nonresident_data(20,8192))})
+        expected=replay(data,'python',1536)
+        for backend in ('python','c'):
+            actual=replay(data,backend,1536,writable=True)
+            for field in ('records','children','stats','directory_sizes','skipped_records'):
+                self.assertEqual(getattr(actual,field),getattr(expected,field))
 
 if __name__=='__main__':unittest.main()

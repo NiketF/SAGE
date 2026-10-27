@@ -6,6 +6,16 @@ attribute parsing, and creates existing FileRecord objects directly. The origina
 reader still owns drive access, cancellation and progress. Python still owns
 hard-link/extension reconciliation, hierarchy, size aggregation, the tree and AI.
 
+Optimization revision 2 avoids building Python name/stream containers for the
+common single-name/single-stream case. It materializes the exact same dictionaries
+when links, extension records, attribute lists or multiple streams need them.
+The reader now supplies an owned writable bytearray, avoiding a bytes copy and
+another full-block copy. It releases the native buffer view before resizing,
+and retains the existing alignment, short-read and record-carry behavior.
+The timing report identifies `parser_optimization_version=2` and
+`read_buffer_mode=owned_bytearray`. Hierarchy calculations use the same directory
+attribute flag directly and reuse local dictionary lookups; their output is unchanged.
+
 The existing Python record parser remains available. `SAGE_MFT_PARSER=auto` is the
 default: it uses C when the extension is installed and Python when it is absent.
 A broken installed extension raises an error, rather than silently hiding a load

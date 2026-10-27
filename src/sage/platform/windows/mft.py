@@ -345,20 +345,26 @@ def _volume_data(kernel32, handle: int) -> NTFS_VOLUME_DATA_BUFFER:
     return volume
 
 
-def _read_at(kernel32, handle: int, offset: int, size: int, sector: int) -> bytes:
+def _read_at(kernel32, handle: int, offset: int, size: int, sector: int) -> bytes | bytearray:
     if size <= 0:
         return b""
     aligned_off = offset - (offset % sector)
     aligned_end = ((offset + size + sector - 1) // sector) * sector
     aligned_size = aligned_end - aligned_off
-    buf = ctypes.create_string_buffer(aligned_size)
+    data = bytearray(aligned_size)
+    buf = (ctypes.c_char * aligned_size).from_buffer(data)
     if not kernel32.SetFilePointerEx(handle, aligned_off, None, FILE_BEGIN):
         raise ctypes.WinError(ctypes.get_last_error())
     read = wintypes.DWORD()
     if not kernel32.ReadFile(handle, buf, aligned_size, ctypes.byref(read), None):
         raise ctypes.WinError(ctypes.get_last_error())
+    del buf  # Release the exported buffer before any resize.
     start = offset - aligned_off
-    return buf.raw[start : start + min(size, max(0, read.value - start))]
+    usable = min(size, max(0, read.value - start))
+    if start:
+        return data[start:start + usable]
+    del data[usable:]
+    return data
 
 
 def _mft_data_runs(record: bytearray) -> list[tuple[int, int]]:
@@ -436,6 +442,8 @@ def enumerate_mft(
     timings = getattr(progress, 'scan_timings', None)
     if timings is not None:
         timings['parser_backend'] = 'c' if batch_parser is not None else 'python'
+        timings['parser_optimization_version'] = getattr(_mft_fast, 'OPTIMIZATION_VERSION', 1) if batch_parser is not None else None
+        timings['read_buffer_mode'] = 'owned_bytearray'
 
     try:
         geometry = _volume_data(kernel32, handle)
@@ -560,7 +568,10 @@ def enumerate_mft(
                     timings['mft_read_seconds'] += time.perf_counter() - read_started
                 if not data:
                     break
-                pending.extend(data)
+                if not pending:
+                    pending = data if isinstance(data, bytearray) else bytearray(data)
+                else:
+                    pending.extend(data)
                 disk_offset += len(data)
                 remaining -= len(data)
                 bytes_seen += len(data)
