@@ -17,7 +17,7 @@ size pass runs only if a record had no `$DATA` size.
 ## Requirements
 
 - Windows 10 or 11
-- Python 3.11 or newer
+- Python 3.11 or newer; 64-bit CPython 3.15.2 is the current team test target
 - An NTFS fixed drive
 - Administrator approval for raw volume access
 
@@ -25,6 +25,28 @@ The runtime and automated tests use only the Python standard library.
 Conversational answers additionally need Ollama running locally with
 `qwen3.5:4b` downloaded. Scanning and basic evidence answers still work if
 Ollama is unavailable.
+
+### Team testing from GitHub
+
+Install the standard **64-bit Windows Python 3.15.2** build with Tcl/Tk support
+from [python.org](https://www.python.org/downloads/release/python-3152/). Use the
+regular build, not the optional free-threaded build. Pull the branch containing
+the matching native parser, then run from the repository folder:
+
+```powershell
+py -3.15 -B .\run_sage.py --scan-timings --mft-parser=c
+```
+
+The included `_mft_fast.cp315-win_amd64.pyd` targets CPython 3.15 x64. The
+existing CPython 3.11 x64 parser remains available for comparison with
+`py -3.11`. The explicit `c` option reports an incompatible or missing parser
+instead of silently using the slower Python fallback. Team members do not need
+a compiler when the correct binary is present. See [parser details](scripts/C-PARSER.md).
+
+The complete 247-test suite passed on both test runtimes. This checks the tested
+behaviour; actual drive speed and AI answer quality still require running the app.
+No runtime is bundled, no installer is produced, and this source change does not
+create a published release.
 
 ## Cleanup suggestions and permanent delete
 

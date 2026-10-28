@@ -10,6 +10,21 @@ static uint64_t r64(const unsigned char *p) { uint64_t n; memcpy(&n,p,8); return
 static uint64_t positive(const unsigned char *p) { int64_t n; memcpy(&n,p,8); return n<0 ? 0 : (uint64_t)n; }
 static int within(size_t n,size_t offset,size_t length) { return offset<=n && length<=n-offset; }
 
+/* Bounded per-block sharing: immutable metadata integers often repeat in
+   neighbouring records. No global cache or retained reference to a prior scan. */
+typedef struct { uint64_t value; PyObject *number; } NumberCache;
+typedef struct { NumberCache parent,modified,allocated; } BlockCache;
+
+static PyObject *cached_number(NumberCache *cache,uint64_t value) {
+    if(value<=256) return PyLong_FromUnsignedLongLong(value);
+    if(cache->number && cache->value==value) return Py_NewRef(cache->number);
+    PyObject *number=PyLong_FromUnsignedLongLong(value);
+    if(!number) return NULL;
+    cache->value=value;
+    Py_XSETREF(cache->number,Py_NewRef(number));
+    return number;
+}
+
 static int fixup(unsigned char *d,size_t n) {
     if(n<8) return 0;
     size_t offset=r16(d+4),count=r16(d+6);
@@ -119,7 +134,7 @@ static int add_name(Parsed *p,uint64_t parent,PyObject *name) {
 }
 
 /* 1=parsed, 0=invalid record, -1=Python exception. All offsets are checked. */
-static int parse(const unsigned char *d,size_t n,Parsed *p) {
+static int parse(const unsigned char *d,size_t n,Parsed *p,BlockCache *cache) {
     if(n<0x30 || memcmp(d,"FILE",4)!=0 || !(r16(d+0x16)&1)) return 0;
     p->sequence=r16(d+0x10); p->base=r64(d+0x20);
     p->directory=!!(r16(d+0x16)&2); p->links=r16(d+0x12);
@@ -160,12 +175,18 @@ static int parse(const unsigned char *d,size_t n,Parsed *p) {
                 size_t chars=d[start+0x40],name_length=chars*2;
                 int ns=d[start+0x41];
                 if(0x42+name_length<=value_length) {
+                    int candidate_rank=ns==3 ? 3 : ns==1 ? 2 : ns==0 ? 1 : 0;
+                    /* A DOS-only spelling cannot replace an already retained
+                       higher-ranked name and is never a hard-link alias. */
+                    if(candidate_rank==0 && rank>=0) {
+                        offset+=length;
+                        continue;
+                    }
                     int byteorder=-1;
                     PyObject *name=PyUnicode_DecodeUTF16((const char *)d+start+0x42,
                         (Py_ssize_t)name_length,"replace",&byteorder);
                     if(!name) return -1;
                     if(PyUnicode_GET_LENGTH(name)) {
-                        int candidate_rank=ns==3 ? 3 : ns==1 ? 2 : ns==0 ? 1 : 0;
                         if(candidate_rank>0) {
                             if(add_name(p,parent,name)<0) { Py_DECREF(name); return -1; }
                         }
@@ -191,7 +212,7 @@ static int parse(const unsigned char *d,size_t n,Parsed *p) {
     if(!p->streams) {
         uint64_t logical=p->has_stream && p->stream_kind==0x80 && p->stream_name_length==0 ? p->stream_logical : 0;
         p->logical=PyLong_FromUnsignedLongLong(logical);
-        p->allocated=PyLong_FromUnsignedLongLong(p->has_stream ? p->stream_allocated : 0);
+        p->allocated=cached_number(&cache->allocated,p->has_stream ? p->stream_allocated : 0);
         if(!p->logical || !p->allocated) return -1;
         if(p->base || p->attribute_list || p->names) {
             if(materialize_names(p)<0 || materialize_streams(p)<0) return -1;
@@ -237,9 +258,9 @@ static int extend_extension(PyObject *extensions,Parsed *p) {
 }
 
 static int store_record(PyObject *records,PyObject *details,PyObject *record_type,
-                        PyObject *attribute_values,Parsed *p,uint64_t frn) {
-    PyObject *id=PyLong_FromUnsignedLongLong(frn),*parent=PyLong_FromUnsignedLongLong(p->parent),
-        *attrs=PyLong_FromUnsignedLong(p->attributes),*modified=PyLong_FromUnsignedLongLong(p->modified),
+                        PyObject *attribute_values,Parsed *p,uint64_t frn,BlockCache *cache) {
+    PyObject *id=PyLong_FromUnsignedLongLong(frn),*parent=cached_number(&cache->parent,p->parent),
+        *attrs=PyLong_FromUnsignedLong(p->attributes),*modified=cached_number(&cache->modified,p->modified),
         *links=PyLong_FromUnsignedLong(p->links),*row=NULL,*detail=NULL;
     int result=-1;
     if(!id || !parent || !attrs || !modified || !links) goto done;
@@ -276,26 +297,32 @@ static PyObject *parse_batch(PyObject *self,PyObject *args) {
     Py_buffer view;
     if(PyObject_GetBuffer(buffer,&view,PyBUF_WRITABLE|PyBUF_C_CONTIGUOUS)<0) return NULL;
     size_t usable=(size_t)view.len/(size_t)record_size*(size_t)record_size;
+    BlockCache cache={0};
+    PyObject *result=NULL;
     uint64_t skipped=0,index=first;
     for(size_t at=0;at<usable;at+=(size_t)record_size,index++) {
         unsigned char *d=(unsigned char *)view.buf+at;
         if(memcmp(d,"FILE",4)!=0 || !(r16(d+0x16)&1)) continue;
         if(!fixup(d,(size_t)record_size)) { skipped++; continue; }
         Parsed p={0};
-        int status=parse(d,(size_t)record_size,&p);
-        if(status<0) { clear_parsed(&p); PyBuffer_Release(&view); return NULL; }
+        int status=parse(d,(size_t)record_size,&p,&cache);
+        if(status<0) { clear_parsed(&p); goto done; }
         if(!status) { skipped++; clear_parsed(&p); continue; }
         int failed=0;
         if(p.base) failed=extend_extension(extensions,&p)<0;
         else if(PyUnicode_GET_LENGTH(p.name)) {
             uint64_t frn=(index&UINT64_C(0xffffffffffff))|((uint64_t)p.sequence<<48);
-            failed=store_record(records,details,record_type,attributes,&p,frn)<0;
+            failed=store_record(records,details,record_type,attributes,&p,frn,&cache)<0;
         } else skipped++;
         clear_parsed(&p);
-        if(failed) { PyBuffer_Release(&view); return NULL; }
+        if(failed) goto done;
     }
+    result=PyLong_FromUnsignedLongLong(skipped);
+done:
+    Py_XDECREF(cache.parent.number); Py_XDECREF(cache.modified.number);
+    Py_XDECREF(cache.allocated.number);
     PyBuffer_Release(&view);
-    return PyLong_FromUnsignedLongLong(skipped);
+    return result;
 }
 
 static PyMethodDef methods[]={
@@ -306,6 +333,6 @@ static struct PyModuleDef module={PyModuleDef_HEAD_INIT,"_mft_fast",NULL,-1,meth
 PyMODINIT_FUNC PyInit__mft_fast(void) {
     PyObject *m=PyModule_Create(&module);
     if(m && PyModule_AddIntConstant(m,"PARSER_VERSION",1)<0) { Py_DECREF(m); return NULL; }
-    if(m && PyModule_AddIntConstant(m,"OPTIMIZATION_VERSION",2)<0) { Py_DECREF(m); return NULL; }
+    if(m && PyModule_AddIntConstant(m,"OPTIMIZATION_VERSION",3)<0) { Py_DECREF(m); return NULL; }
     return m;
 }

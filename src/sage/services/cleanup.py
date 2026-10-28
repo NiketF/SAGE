@@ -126,10 +126,15 @@ def find_cleanup_suggestions(
         return []
     prefix = len(result.volume.drive) + 1
     found: list[CleanupSuggestion] = []
+    # Only reject impossible names here; the original ordered rules decide eligibility.
+    candidate_names = {name for rule in _RULES for name in rule.names}
+    candidate_suffixes = tuple(suffix for rule in _RULES for suffix in rule.suffixes)
     for record in result.records.values():
         if record.frn == result.root_frn:
             continue
         name = record.name.casefold()
+        if name not in candidate_names and not name.endswith(candidate_suffixes):
+            continue
         relative: str | None = None
         for rule in _RULES:
             if rule.directory != record.is_directory:

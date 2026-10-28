@@ -11,6 +11,8 @@ import ctypes
 import os
 import struct
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Iterator
 from ctypes import wintypes
 
@@ -367,6 +369,42 @@ def _read_at(kernel32, handle: int, offset: int, size: int, sector: int) -> byte
     return data
 
 
+def _read_mft_run(kernel32, handle, offset, remaining, sector, cancelled, timings, reader=None):
+    """Read one run in order, optionally overlapping one next block with parsing."""
+    def read_block(at, size, started=None):
+        if started is not None:
+            started.set()
+        began = time.perf_counter()
+        data = _read_at(kernel32, handle, at, size, sector)
+        return data, time.perf_counter() - began
+
+    pending = None
+    while remaining > 0:
+        if cancelled and cancelled():
+            raise InterruptedError("MFT scan cancelled.")
+        if pending is None:
+            data, seconds = read_block(offset, min(remaining, MFT_BUFFER_SIZE))
+        else:
+            data, seconds = pending.result()
+            pending = None
+        if timings is not None:
+            timings['mft_read_seconds'] += seconds
+            timings['mft_bytes_read'] += len(data)
+            timings['mft_read_calls'] += 1
+        if not data:
+            break
+        offset += len(data)
+        remaining -= len(data)
+        if reader is not None and remaining > 0:
+            if cancelled and cancelled():
+                raise InterruptedError("MFT scan cancelled.")
+            started = threading.Event()
+            pending = reader.submit(read_block, offset, min(remaining, MFT_BUFFER_SIZE), started)
+            # Ensure I/O starts before the C parser holds the GIL for this block.
+            started.wait()
+        yield data
+
+
 def _mft_data_runs(record: bytearray) -> list[tuple[int, int]]:
     # ponytail: mapping pairs come from $MFT record 0 only. If that record uses
     # $ATTRIBUTE_LIST, scan fails; follow the list if a volume ever hits that.
@@ -405,6 +443,9 @@ def enumerate_mft(
     parser_choice = os.environ.get('SAGE_MFT_PARSER', 'auto').casefold()
     if parser_choice not in {'auto', 'python', 'c'}:
         raise ValueError('SAGE_MFT_PARSER must be auto, python or c.')
+    read_ahead = os.environ.get('SAGE_MFT_READ_AHEAD', 'auto').casefold()
+    if read_ahead not in {'auto', 'on', 'off'}:
+        raise ValueError('SAGE_MFT_READ_AHEAD must be auto, on or off.')
     batch_parser = None
     if parser_choice != 'python':
         try:
@@ -445,12 +486,16 @@ def enumerate_mft(
         timings['parser_optimization_version'] = getattr(_mft_fast, 'OPTIMIZATION_VERSION', 1) if batch_parser is not None else None
         timings['read_buffer_mode'] = 'owned_bytearray'
 
+    reader = None
     try:
         geometry = _volume_data(kernel32, handle)
         sector = geometry.BytesPerSector
         cluster = geometry.BytesPerCluster
         record_size = geometry.BytesPerFileRecordSegment
         valid = geometry.MftValidDataLength
+        if timings is not None:
+            timings.update(mft_valid_bytes=valid, mft_record_bytes=record_size,
+                           mft_bytes_read=0, mft_read_calls=0)
         read_started = time.perf_counter()
         first = _read_at(
             kernel32,
@@ -461,14 +506,21 @@ def enumerate_mft(
         )
         if timings is not None:
             timings['mft_read_seconds'] += time.perf_counter() - read_started
+            timings['mft_bytes_read'] += len(first)
+            timings['mft_read_calls'] += 1
         if len(first) < record_size:
             raise OSError("Could not read $MFT record 0.")
         parse_started = time.perf_counter()
         runs = _mft_data_runs(bytearray(first))
         if timings is not None:
             timings['record_parsing_seconds'] += time.perf_counter() - parse_started
+            timings['mft_data_runs'] = len(runs)
         if sum(count for _lcn, count in runs) * cluster < valid:
             raise OSError("$MFT requires additional mapping records; refusing an incomplete scan.")
+        if read_ahead == 'on' or read_ahead == 'auto' and valid >= 2 * MFT_BUFFER_SIZE:
+            reader = ThreadPoolExecutor(max_workers=1, thread_name_prefix='sage-mft-read')
+        if timings is not None:
+            timings['read_pipeline'] = 'one_block_ahead' if reader is not None else 'sequential'
         if progress:
             progress(0)
         if progress_details:
@@ -557,32 +609,28 @@ def enumerate_mft(
                 bytes_seen += take
                 continue
             disk_offset = lcn * cluster
-            remaining = take
-            while remaining > 0:
-                if cancelled and cancelled():
-                    raise InterruptedError("MFT scan cancelled.")
-                chunk = min(remaining, MFT_BUFFER_SIZE)
-                read_started = time.perf_counter()
-                data = _read_at(kernel32, handle, disk_offset, chunk, sector)
-                if timings is not None:
-                    timings['mft_read_seconds'] += time.perf_counter() - read_started
-                if not data:
-                    break
+            for data in _read_mft_run(kernel32, handle, disk_offset, take, sector,
+                                      cancelled, timings, reader):
                 if not pending:
                     pending = data if isinstance(data, bytearray) else bytearray(data)
                 else:
                     pending.extend(data)
-                disk_offset += len(data)
-                remaining -= len(data)
                 bytes_seen += len(data)
                 consume_pending()
         consume_pending()
         if bytes_seen < valid:
             raise OSError("$MFT read ended before its valid length; scan is incomplete.")
     finally:
-        kernel32.CloseHandle(handle)
+        try:
+            if reader is not None:
+                reader.shutdown(wait=True)
+        finally:
+            kernel32.CloseHandle(handle)
 
     reconcile_started = time.perf_counter()
+    if timings is not None:
+        timings.update(base_records=len(records), records_with_extra_attributes=len(record_details),
+                       extension_groups=len(extensions))
     skipped += _complete_mft_records(records, record_details, extensions, cancelled)
     if timings is not None:
         timings['links_and_extensions_seconds'] = time.perf_counter() - reconcile_started
@@ -618,15 +666,14 @@ def _complete_mft_records(records, record_details, extensions, cancelled=None):
         record = records[frn]
         if record.is_directory:
             continue  # Never synthesize directory aliases or follow junctions.
-        aliases = list(dict.fromkeys(tuple(pair) for pair in details['names']))
+        aliases = dict.fromkeys(map(tuple, details['names']))
         if aliases and (record.parent_frn, record.name) not in aliases:
-            record.parent_frn, record.name = aliases[0]  # Long name may be in an extension; omit its DOS alias.
-        seen = {(record.parent_frn, record.name)}
-        record.link_count = max(record.link_count, len(set(aliases) | seen))
+            record.parent_frn, record.name = next(iter(aliases))  # Long name may be in an extension; omit its DOS alias.
+        primary = (record.parent_frn, record.name)
+        record.link_count = max(record.link_count, len(aliases), 1)
         for parent, name in aliases:
-            if (parent, name) in seen:
+            if (parent, name) == primary:
                 continue
-            seen.add((parent, name))
             # Negative IDs are internal path-entry IDs, never native file IDs.
             while alias_id in records:
                 alias_id -= 1

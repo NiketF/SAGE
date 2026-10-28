@@ -49,6 +49,11 @@ def main() -> int:
                 if choice not in {'auto', 'python', 'c'}:
                     raise ValueError('--mft-parser must be auto, python or c.')
                 os.environ['SAGE_MFT_PARSER'] = choice
+            if option.startswith('--mft-read-ahead='):
+                choice = option.split('=', 1)[1]
+                if choice not in {'auto', 'on', 'off'}:
+                    raise ValueError('--mft-read-ahead must be auto, on or off.')
+                os.environ['SAGE_MFT_READ_AHEAD'] = choice
         _log(
             f"start pid={os.getpid()} cwd={os.getcwd()!r} "
             f"executable={sys.executable!r} argv={sys.argv!r} admin={is_admin()} "

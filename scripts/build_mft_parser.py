@@ -1,4 +1,4 @@
-"""Build the optional C parser with a Windows x64 MinGW-w64 GCC compiler.
+r"""Build the optional C parser with a Windows x64 MinGW-w64 GCC compiler.
 
 python scripts/build_mft_parser.py --cc C:\path\to\gcc.exe
 Only Python's standard library and development headers are used.
