@@ -2,7 +2,6 @@
   <img src="https://github.com/NiketF/SAGE/blob/main/SAGE_Banner.jpeg?raw=true" alt="SAGE Banner" width="100%">
 </p>
 
-<div align="center">
 
 **A fast Windows storage explorer with an AI assistant that runs locally.**
 
@@ -118,7 +117,7 @@ The current improvements reduce parser allocations and block copies, use a C bat
 - Windows 10 or 11 and an NTFS fixed drive.
 - Administrator approval for raw volume access.
 - **64-bit Python 3.11** to use the included compiled parser.
-- Optional: [Ollama for Windows](https://ollama.com/download/windows) and the `qwen3.5:4b` model for conversational AI.
+- [Ollama for Windows](https://ollama.com/download/windows) and the `qwen3.5:4b` model for conversational AI.
 
 Python 3.11 or newer can run the source application. Other Python versions need a matching compiled-parser build for the fast path; the Python parser remains available. The included binary targets **CPython 3.11 / Windows x64**.
 
@@ -221,10 +220,7 @@ Found a scan mismatch, an unclear answer or a performance issue? [Open an issue]
 
 ---
 
-<div align="center">
-
 **See the space. Ask the question. Make an informed choice.**
 
 [**Get the SAGE source**](https://github.com/NiketF/SAGE/archive/refs/heads/main.zip) · [Explore the code](https://github.com/NiketF/SAGE) · [Report an issue](https://github.com/NiketF/SAGE/issues)
 
-</div>
