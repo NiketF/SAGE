@@ -95,31 +95,46 @@ def calculate_stats(result: ScanResult, *, include_sizes: bool = False) -> dict[
     size_totals: dict[int, tuple[int, int]] = {}
     get_record = result.records.get
     get_children = result.children.get
-    for frn in _directory_postorder(result):
-        files = 0
-        folders = 0
-        logical = 0
-        allocated = 0
-        if include_sizes:
-            own = result.records[frn]
-            allocated = own.allocated_size if own.size_ready else 0
-        for child_frn in get_children(frn, ()):
-            child = get_record(child_frn)
-            if child is None:
+    # Count files while discovering folders, rather than reading every child twice.
+    stack = [(result.root_frn, None)]
+    active = set()
+    while stack:
+        frn, pending = stack.pop()
+        if pending is None:
+            if frn in totals or frn in active:
                 continue
-            if child.attributes & FILE_ATTRIBUTE_DIRECTORY:
-                child_items, child_files, child_folders = totals.get(child_frn, (0, 0, 0))
-                files += child_files
-                folders += child_folders + 1
-                if include_sizes:
-                    child_logical, child_allocated = size_totals.get(child_frn, (0, 0))
-                    logical += child_logical
-                    allocated += child_allocated
-            else:
-                files += 1
-                if include_sizes:
-                    logical += child.logical_size
-                    allocated += child.allocated_size
+            active.add(frn)
+            child_folders = []
+            files = logical = allocated = 0
+            if include_sizes:
+                own = result.records[frn]
+                allocated = own.allocated_size if own.size_ready else 0
+            for child_frn in get_children(frn, ()):
+                child = get_record(child_frn)
+                if child is None:
+                    continue
+                if child.attributes & FILE_ATTRIBUTE_DIRECTORY:
+                    child_folders.append(child_frn)
+                else:
+                    files += 1
+                    if include_sizes:
+                        logical += child.logical_size
+                        allocated += child.allocated_size
+            stack.append((frn, (child_folders, files, logical, allocated)))
+            for child_frn in child_folders:
+                stack.append((child_frn, None))
+            continue
+        child_folders, files, logical, allocated = pending
+        active.remove(frn)
+        folders = 0
+        for child_frn in child_folders:
+            child_items, child_files, nested_folders = totals.get(child_frn, (0, 0, 0))
+            files += child_files
+            folders += nested_folders + 1
+            if include_sizes:
+                child_logical, child_allocated = size_totals.get(child_frn, (0, 0))
+                logical += child_logical
+                allocated += child_allocated
         totals[frn] = (files + folders, files, folders)
         if include_sizes:
             size_totals[frn] = (logical, allocated)

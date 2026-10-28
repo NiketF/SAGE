@@ -51,9 +51,8 @@ class HierarchyTests(unittest.TestCase):
         volume = VolumeInfo('C:','Test','NTFS')
         expected = build_scan_result(volume,{key:replace(row) for key,row in records.items()})
         calculate_directory_sizes(expected)
-        with patch.object(hierarchy,'_directory_postorder',wraps=hierarchy._directory_postorder) as walk:
+        with patch.object(hierarchy,'_directory_postorder',side_effect=AssertionError('No second traversal')):
             actual = build_scan_result(volume,{key:replace(row) for key,row in records.items()},include_sizes=True)
-            self.assertEqual(walk.call_count,1)
         for field in ('records','children','stats','directory_sizes','sizes_complete'):
             self.assertEqual(getattr(actual,field),getattr(expected,field),field)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import time
 
+from ..config import FILE_ATTRIBUTE_DIRECTORY
 from ..models import ScanResult
 from ..platform.windows.drives import get_volume_info
 from ..platform.windows.mft import enumerate_mft
@@ -42,19 +43,25 @@ def scan_ntfs(
     if stage:
         stage("Building MFT hierarchy")
     readiness_started = time.perf_counter()
-    files = [record for record in records.values() if not record.is_directory]
-    sizes_ready = all(record.size_ready for record in files)
+    file_count = 0
+    sizes_ready = True
+    for record in records.values():
+        if not record.attributes & FILE_ATTRIBUTE_DIRECTORY:
+            file_count += 1
+            if not record.size_ready:
+                sizes_ready = False
     if timings is not None:
         timings['file_readiness_seconds'] = time.perf_counter() - readiness_started
     hierarchy_started = time.perf_counter()
     result = build_scan_result(volume, records, skipped, include_sizes=sizes_ready)
     hierarchy_seconds = time.perf_counter() - hierarchy_started
     if sizes_ready:
-        result.sized_files = len(files)
+        result.sized_files = file_count
     if timings is not None:
         timings.update(hierarchy_and_counts_seconds=hierarchy_seconds,
                        hierarchy_and_totals_seconds=hierarchy_seconds if sizes_ready else None,
                        aggregation_mode='combined' if sizes_ready else 'counts_only_pending_sizes',
+                       aggregation_algorithm='single_child_pass',
                        folder_sizes_seconds=0.0,
                        scanner_total_seconds=time.perf_counter() - scan_started,
                        records=len(result.records), skipped_records=skipped,

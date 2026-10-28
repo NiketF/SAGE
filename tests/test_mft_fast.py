@@ -50,6 +50,25 @@ def replay(data,backend,chunk_size=4*1024*1024,progress=None,writable=False):
 
 @unittest.skipUnless(importlib.util.find_spec('sage.platform.windows._mft_fast'), 'Build the optional C parser first')
 class CompiledParserTests(unittest.TestCase):
+    def test_name_ranking_preserves_dos_only_and_namespace_order(self):
+        entries = {5: make_mft_record(pack_file_name('.',ROOT),flags=3)}
+        for i, namespaces in enumerate(((2,), (2,1), (1,2), (2,2), (0,2,1,3), (3,1,0,2)), 6):
+            names=[pack_file_name(f'name{n}-{j}', ROOT+j, ns=n) for j,n in enumerate(namespaces)]
+            entries[i]=make_mft_record(*names,pack_nonresident_data(1000,4096))
+        invalid=bytearray(pack_file_name('ab',ROOT))
+        invalid[0x18+0x42:0x18+0x44]=b'\x00\xd8'
+        entries[20]=make_mft_record(bytes(invalid),pack_file_name('DOS~1',ROOT,ns=2))
+        self.compare(snapshot(entries),4096)
+
+    def test_repeated_metadata_remains_valid_across_batches(self):
+        standard=bytearray(0x30)
+        struct.pack_into('<Q',standard,8,116444736000000000+1700000000*10000000)
+        entries={5:make_mft_record(pack_file_name('.',ROOT),flags=3)}
+        for i in range(6,50):
+            entries[i]=make_mft_record(pack_resident_attr(0x10,standard),
+                pack_file_name(f'file{i}',ROOT),pack_nonresident_data(i,4096))
+        self.compare(snapshot(entries),4096)
+
     def compare(self,data,chunk_size=4*1024*1024):
         expected=replay(data,'python',chunk_size)
         actual=replay(data,'c',chunk_size)

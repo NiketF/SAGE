@@ -45,6 +45,40 @@ def cleanup_scan():
 
 
 class CleanupSuggestionTests(unittest.TestCase):
+    def test_large_candidates_stay_ranked_without_nested_or_unrelated_entries(self):
+        result = cleanup_scan()
+        gb = 1024 ** 3
+        extra = [FileRecord(200, 28, 'LARGE.MSI', 0, 50*gb, 50*gb, size_ready=True),
+                 FileRecord(201, 14, 'installer.exe', 0, 1024*gb, 1024*gb, size_ready=True),
+                 FileRecord(202, 5, 'Cache', D),
+                 FileRecord(203, 202, 'large.bin', 0, 2000*gb, 2000*gb, size_ready=True)]
+        for record in extra:
+            result.records[record.frn] = record
+            result.children.setdefault(record.parent_frn, []).append(record.frn)
+        calculate_directory_sizes(result)
+        suggestions = find_cleanup_suggestions(result)
+        self.assertEqual([s.path for s in suggestions], [
+            r'C:\Users\hp\AppData\Local\Temp',
+            r'C:\Users\hp\Downloads\LARGE.MSI',
+            r'C:\Windows\SoftwareDistribution\Download',
+            r'C:\Users\hp\AppData\Local\Google\Chrome\User Data\Default\Cache',
+            r'C:\Users\hp\Projects\site\node_modules',
+            r'C:\Users\hp\Downloads\tool-setup.exe'])
+        self.assertEqual([s.allocated for s in suggestions],
+                         sorted((s.allocated for s in suggestions), reverse=True))
+        self.assertEqual(suggestions[1].allocated, 50*gb)
+        self.assertFalse(suggestions[1].contents_only)
+        self.assertTrue(suggestions[0].contents_only)
+
+    def test_size_threshold_and_result_limit_remain_unchanged(self):
+        result = cleanup_scan()
+        self.assertEqual([s.path for s in find_cleanup_suggestions(result, minimum=500*MB)], [
+            r'C:\Windows\SoftwareDistribution\Download',
+            r'C:\Users\hp\AppData\Local\Google\Chrome\User Data\Default\Cache'])
+        self.assertEqual([s.path for s in find_cleanup_suggestions(result, limit=1)],
+                         [r'C:\Windows\SoftwareDistribution\Download'])
+        self.assertEqual(find_cleanup_suggestions(result, minimum=10000*MB), [])
+
     def test_lists_specific_regenerable_items_largest_first(self):
         suggestions = find_cleanup_suggestions(cleanup_scan())
         paths = [s.path for s in suggestions]
