@@ -55,11 +55,12 @@ class ToolRegistry:
         self._uninstall_actions={}
         self._children_cache={}
         self._cleanup_cache=None
+        self.scan_changes = None
 
     def cleanup_suggestions(self):
         if not self.evidence or not self.evidence.result.sizes_complete:return []
         if self._cleanup_cache is None:self._cleanup_cache=find_cleanup_suggestions(self.evidence.result)
-        return self._cleanup_cache
+        return [s for s in self._cleanup_cache if not self.scan_changes or not self.scan_changes.affected(s.path)]
 
     def validate(self, name: str, arguments: dict) -> None:
         if not isinstance(arguments,dict):
@@ -145,6 +146,32 @@ class ToolRegistry:
             return default
 
     def call(self, name: str, arguments: dict) -> dict:
+        changes = self.scan_changes
+        if changes and changes.stale:
+            path = arguments.get('path') if isinstance(arguments, dict) else None
+            if path and changes.is_removed(path):
+                return {'error': 'This item was removed after the scan. Refresh to inspect current contents.', 'path': path}
+            if name == 'report_fact' and arguments.get('field') != 'drive_capacity':
+                path = path or (self.focus[0] if len(self.focus) == 1 else None)
+                if path and changes.affected(path):
+                    return {'error': 'This scan measurement predates file changes. Refresh for a current measurement.'}
+        result = self._call(name, arguments)
+        if changes and changes.stale:
+            def annotate(value):
+                if isinstance(value, list):
+                    return [annotate(item) for item in value]
+                if isinstance(value, dict):
+                    value = {key: annotate(item) for key, item in value.items()}
+                    path = value.get('path')
+                    if isinstance(path, str) and changes.affected(path):
+                        value['scan_item_status'] = 'removed_after_scan' if changes.is_removed(path) else 'changed_after_scan'
+                return value
+            if not (name == 'report_fact' and arguments.get('field') == 'drive_capacity'):
+                result = annotate(result)
+            result = dict(result, scan_change_notice=changes.context())
+        return result
+
+    def _call(self, name: str, arguments: dict) -> dict:
         self.validate(name, arguments)
         arguments = dict(arguments)
         if name=='report_fact':

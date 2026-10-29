@@ -33,6 +33,18 @@ class SHFILEOPSTRUCTW(ctypes.Structure):
     ]
 
 
+def show_properties(path: str, owner_hwnd: int = 0) -> None:
+    """Open the real Windows property sheet from SAGE's long-lived UI process."""
+    if not os.path.isabs(path) or '\0' in path:
+        raise ValueError('Properties requires an absolute file or folder path.')
+    shell32 = ctypes.WinDLL('shell32', use_last_error=True)
+    shell32.SHObjectProperties.argtypes = [wintypes.HWND, wintypes.DWORD,
+                                          wintypes.LPCWSTR, wintypes.LPCWSTR]
+    shell32.SHObjectProperties.restype = wintypes.BOOL
+    if not shell32.SHObjectProperties(owner_hwnd, 2, path, None):  # SHOP_FILEPATH
+        raise OSError('Windows could not open Properties for this item.')
+
+
 def _multistring(paths: list[str]) -> ctypes.Array:
     if not paths:
         raise ValueError("Choose at least one file or folder.")

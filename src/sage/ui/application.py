@@ -5,6 +5,9 @@ from __future__ import annotations
 import queue
 import os
 import subprocess
+import json
+import sys
+from pathlib import Path
 import threading
 import time
 import tkinter as tk
@@ -15,7 +18,8 @@ from .. import __version__
 from ..config import APP_NAME, APP_SUBTITLE, MIN_WINDOW_SIZE, WINDOW_SIZE
 from ..models import ScanResult, VolumeInfo
 from ..platform.windows.drives import get_disk_space, list_ntfs_volumes
-from ..platform.windows.file_operations import delete_permanently, empty_recycle_bin, shell_file_operation
+from ..platform.windows.file_operations import delete_permanently, empty_recycle_bin, shell_file_operation, show_properties
+from ..services.scan_changes import observe_paths, ScanChanges
 from ..services.cleanup import CleanupSuggestion, cleanup_report
 from ..services.evidence import EvidenceAssistant, format_bytes
 from ..services.local_ai import OllamaClient
@@ -196,7 +200,7 @@ class SageApplication(tk.Tk):
         self._sort_box.grid(row=0, column=2, padx=(0, 8), pady=(4, 4))
         self._sort_box.bind("<<ComboboxSelected>>", self._on_sort_changed)
         ttk.Separator(left, orient="horizontal").grid(row=1, column=0, sticky="ew")
-        self.tree_panel = TreePanel(left, on_sort=self._sync_sort, on_ask_sage=self._on_tree_ask_sage)
+        self.tree_panel = TreePanel(left, on_sort=self._sync_sort)
         self.tree_panel.grid(row=2, column=0, sticky="nsew")
         self.tree_panel.tree.bind("<<TreeviewSelect>>", self._on_tree_selected)
         self.tree_panel.tree.bind("<Button-3>", self._show_tree_menu)
@@ -207,6 +211,10 @@ class SageApplication(tk.Tk):
         self.tree_panel.tree.bind("<Delete>", self._recycle_selection)
         self.tree_panel.tree.bind("<F2>", self._rename_selection)
         self._tree_menu = tk.Menu(self, tearoff=False)
+        self._changes_banner = ttk.Frame(left, padding=(12, 6))
+        self._changes_var = tk.StringVar()
+        ttk.Label(self._changes_banner, textvariable=self._changes_var, wraplength=650).pack(side="left", fill="x", expand=True)
+        ttk.Button(self._changes_banner, text="Refresh analysis", command=self._start_scan).pack(side="right")
         self.assistant_panel = AssistantPanel(right, self._answer)
         self.assistant_panel.pack(fill="both", expand=True)
 
@@ -381,7 +389,8 @@ class SageApplication(tk.Tk):
                     self._assistant_busy = False
                     self.assistant_panel.finish_reply(event[3])
                     if len(event) > 4 and event[4]:
-                        self.assistant_panel.add_cleanup_actions(event[4], self._delete_suggestion)
+                        suggestions = [s for s in event[4] if not self.tree_panel.changes.affected(s.path)]
+                        self.assistant_panel.add_cleanup_actions(suggestions, self._delete_suggestion)
                         self._conversation.remember_suggestions(event[4])
                     if len(event) > 5 and event[5]:
                         self.assistant_panel.add_open_buttons(event[5], self._open_settings)
@@ -406,20 +415,10 @@ class SageApplication(tk.Tk):
                             self.assistant_panel.set_status(f"Preparing local search: {event[2]:,}/{event[3]:,} items")
                 elif kind == "error":
                     self._job_failed(event[2], event[3])
+                elif kind == "native_menu_done":
+                    self._native_menu_finished(*event[2:])
                 elif kind == "operation_done":
                     self._operation_finished(*event[2:])
-                elif kind == "operation_error":
-                    self._file_operation_running = False
-                    self.scan_button.configure(state="normal")
-                    self.drive_box.configure(state="readonly")
-                    self.progress_bar.stop()
-                    self.progress_bar.configure(mode="determinate", value=0)
-                    self._job_failed("File operation", event[2])
-                    if event[3]:
-                        self._start_scan()
-                    elif self._pending_size_completion is not None:
-                        self._size_finished(self._pending_size_completion)
-                        self._pending_size_completion = None
         except queue.Empty:
             pass
         if self.winfo_exists():
@@ -433,6 +432,7 @@ class SageApplication(tk.Tk):
         if timings is not None:
             timings['scan_to_ui_handler_seconds'] = self._mft_elapsed
         self._size_started_at = time.monotonic()
+        self._changes_banner.grid_remove()
         self._result = result
         self._assistant.set_result(result)
         if self._assistant_busy:
@@ -442,6 +442,7 @@ class SageApplication(tk.Tk):
         self._conversation = ConversationAssistant(result)
         tree_started = time.monotonic()
         self.tree_panel.show_result(result)
+        self._conversation.tools.scan_changes = self.tree_panel.changes
         if timings is not None:
             timings['tree_insert_seconds'] = time.monotonic() - tree_started
         self.assistant_panel.set_selected_item(None)
@@ -515,6 +516,9 @@ class SageApplication(tk.Tk):
         if getattr(self, '_assistant_busy', False) or getattr(self, '_file_operation_running', False):
             self.after(100, lambda: self._cleanup_finished(result, conversation, suggestions, compute_seconds))
             return
+        changes = getattr(getattr(self, 'tree_panel', None), 'changes', None)
+        if isinstance(changes, ScanChanges):
+            suggestions = [s for s in suggestions if not changes.affected(s.path)]
         buttons_started = time.monotonic()
         self.assistant_panel.write('SAGE', cleanup_report(result, suggestions))
         self.assistant_panel.add_cleanup_actions(suggestions, self._delete_suggestion)
@@ -540,6 +544,8 @@ class SageApplication(tk.Tk):
 
     def _answer(self, question: str, quoted: str = "") -> str | None:
         conversation = self._conversation
+        if self._file_operation_running:
+            return "Wait for the current Windows operation to finish, then ask again."
         if self._assistant_busy:
             return "I am still answering the previous question. Please try again shortly."
         self._assistant_busy = True
@@ -589,7 +595,7 @@ class SageApplication(tk.Tk):
             for frn in self.tree_panel.selected_frns()
             if frn != result.root_frn
         ]
-        unique = list(dict.fromkeys(path for path in paths if path))
+        unique = list(dict.fromkeys(path for path in paths if path and not self.tree_panel.changes.is_removed(path)))
         return [
             path for path in unique
             if not any(
@@ -608,8 +614,69 @@ class SageApplication(tk.Tk):
             self.tree_panel.tree.selection_set(iid)
         paths = self._selected_paths()
         selected = bool(paths) and not self._file_operation_running
+        self._show_sage_menu(event, paths, selected)
+
+    def _show_native_menu(self, paths, event):
+        if self._file_operation_running or not paths or self._selected_paths() != paths:
+            return False
+        if len({os.path.normcase(os.path.dirname(p)) for p in paths}) != 1:
+            return False
+        generation = self._generation
+        request = {'paths': paths, 'x': event.x_root, 'y': event.y_root,
+                   'shift': bool(event.state & 1), 'paste': bool(self._clipboard_paths)}
+        self._file_operation_running = True
+        self.scan_button.configure(state="disabled")
+        self.drive_box.configure(state="disabled")
+        helper = Path(__file__).resolve().parents[1] / 'platform/windows/shell_menu.py'
+        def worker():
+            before = observe_paths(paths)
+            try:
+                result = subprocess.run([sys.executable, '-B', str(helper)],
+                    input=json.dumps(request), capture_output=True, text=True,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                response = json.loads(result.stdout) if result.returncode == 0 else {'fallback': True}
+            except (OSError, ValueError):
+                response = {'fallback': True}
+            self._events.put(('native_menu_done', generation, paths, request, response,
+                              before, observe_paths(paths)))
+        threading.Thread(target=worker, daemon=True, name='sage-shell-menu').start()
+        return True
+
+    def _native_menu_finished(self, paths, request, response, before, after):
+        self._file_operation_running = False
+        self.scan_button.configure(state="normal")
+        self.drive_box.configure(state="readonly")
+        if response.get('fallback'):
+            from types import SimpleNamespace
+            self._show_sage_menu(SimpleNamespace(x_root=request['x'], y_root=request['y']), paths, True)
+        elif response.get('action'):
+            action = response['action']
+            handlers = {'ask': lambda: self._on_tree_ask_sage(paths[0]),
+                        'reveal': self._reveal_selection, 'copy_path': self._copy_path,
+                        'copy_to': self._copy_to, 'move_to': self._move_to,
+                        'paste': self._paste_selection, 'rename': self._rename_selection,
+                        'recycle': self._recycle_selection, 'copy': self._copy_selection,
+                        'cut': self._cut_selection, 'properties': self._properties_selection}
+            # The selection may change while the isolated menu is open.
+            if self._selected_paths() != paths:
+                self.status_var.set("Selection changed. Open the menu again for the intended items.")
+            elif action in handlers:
+                handlers[action]()
+        elif response.get('invoked'):
+            if before != after or response.get('verb') not in {'open', 'explore', 'properties', 'edit', 'print'}:
+                self.tree_panel.changes.record(before, after, deletion=False)
+                self._publish_changes()
+            if response.get('error'):
+                messagebox.showerror(APP_NAME, response['error'])
+        if self._pending_size_completion is not None and not self._file_operation_running:
+            self._size_finished(self._pending_size_completion)
+            self._pending_size_completion = None
+
+    def _show_sage_menu(self, event, paths, selected):
         menu = self._tree_menu
         menu.delete(0, "end")
+        menu.add_command(label="Ask SAGE", command=lambda: self._on_tree_ask_sage(paths[0]), state="normal" if len(paths) == 1 and selected else "disabled")
+        menu.add_separator()
         menu.add_command(label="Open", command=self._open_selection, state="normal" if selected else "disabled")
         menu.add_command(label="Show in Explorer", command=self._reveal_selection, state="normal" if selected else "disabled")
         menu.add_command(label="Copy path", command=self._copy_path, state="normal" if selected else "disabled")
@@ -625,6 +692,13 @@ class SageApplication(tk.Tk):
                          state="normal" if len(paths) == 1 and selected else "disabled")
         menu.add_command(label="Send to Recycle Bin…", command=self._recycle_selection,
                          state="normal" if selected else "disabled")
+        menu.add_separator()
+        menu.add_command(label="Properties", command=self._properties_selection,
+                         state="normal" if len(paths) == 1 and selected else "disabled")
+        menu.add_separator()
+        native_available = selected and len({os.path.normcase(os.path.dirname(p)) for p in paths}) == 1
+        menu.add_command(label="More Windows options", command=lambda: self._show_native_menu(paths, event),
+                         state="normal" if native_available else "disabled")
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -639,6 +713,15 @@ class SageApplication(tk.Tk):
         if record and not record.is_directory:
             self.tree_panel.tree.selection_set(iid)
             self._open_selection()
+
+    def _properties_selection(self) -> None:
+        paths = self._selected_paths()
+        if len(paths) == 1 and not self._file_operation_running:
+            try:
+                # Keep the owner process alive; the transient menu helper exits.
+                show_properties(paths[0], self.winfo_id())
+            except OSError as exc:
+                messagebox.showerror(APP_NAME, f"Could not open Properties.\n\n{exc}")
 
     def _open_settings(self, target: str) -> None:
         os.startfile(target)
@@ -687,6 +770,8 @@ class SageApplication(tk.Tk):
         if not self._clipboard_paths or result is None or len(selected) != 1:
             return "break"
         frn = selected[0]
+        if self.tree_panel.changes.is_removed(result.path_for(frn) or ""):
+            return "break"
         record = result.records.get(frn)
         if record is None:
             return "break"
@@ -739,6 +824,9 @@ class SageApplication(tk.Tk):
         result = self._result
         if result is None or self._file_operation_running:
             return
+        if self.tree_panel.changes.affected(suggestion.path):
+            messagebox.showinfo(APP_NAME, "This cleanup item has changed. Refresh before using this old suggestion.")
+            return
         if suggestion.action.startswith("uninstall:"):
             current=self._conversation.uninstall_suggestions([suggestion.path])
             if not any(item.path==suggestion.path and item.action==suggestion.action for item in current):
@@ -777,7 +865,8 @@ class SageApplication(tk.Tk):
             return delete_permanently(suggestion.path, suggestion.contents_only) == 0
 
         if messagebox.askyesno("Delete permanently", prompt, icon="warning", parent=self):
-            self._run_file_operation("permanent delete", [suggestion.path], operation=operation)
+            self._run_file_operation("permanent delete", [suggestion.path], operation=operation,
+                                     contents_only=suggestion.contents_only or suggestion.action == "empty_recycle_bin")
 
     def _run_file_operation(
         self,
@@ -785,6 +874,7 @@ class SageApplication(tk.Tk):
         paths: list[str],
         destination: str | None = None,
         operation: Callable[[], bool] | None = None,
+        contents_only: bool = False,
     ) -> None:
         if self._file_operation_running or not paths:
             return
@@ -807,7 +897,8 @@ class SageApplication(tk.Tk):
             == os.path.normcase(result.volume.drive)
         )
         self._file_operation_running = True
-        if requires_rescan:
+        deletion = action in {"recycle", "permanent delete"}
+        if requires_rescan and not deletion:
             self._size_cancel.set()
         self.scan_button.configure(state="disabled")
         self.drive_box.configure(state="disabled")
@@ -820,15 +911,28 @@ class SageApplication(tk.Tk):
         owner_hwnd = self.winfo_id()
 
         def worker() -> None:
+            # Observe only selected targets (or direct contents), never walk the drive.
+            targets = paths
+            if contents_only:
+                try:
+                    targets = [entry.path for path in paths for entry in os.scandir(path)]
+                except OSError:
+                    targets = []
+            before = observe_paths(targets) if deletion else {}
+            error = None
+            completed = False
             try:
                 completed = operation() if operation else shell_file_operation(action, paths, destination, owner_hwnd)
-                self._events.put(("operation_done", generation, action, completed, requires_rescan))
             except Exception as exc:
-                self._events.put(("operation_error", generation, exc, requires_rescan))
+                error = exc
+            after = observe_paths(targets) if deletion else {}
+            self._events.put(("operation_done", generation, action, completed, requires_rescan,
+                              before, after, paths if contents_only else [], error))
 
         threading.Thread(target=worker, daemon=True, name="sage-file-operation").start()
 
-    def _operation_finished(self, action: str, completed: bool, requires_rescan: bool) -> None:
+    def _operation_finished(self, action: str, completed: bool, requires_rescan: bool,
+                            before=None, after=None, changed_paths=(), error=None) -> None:
         self._file_operation_running = False
         self.scan_button.configure(state="normal")
         self.drive_box.configure(state="readonly")
@@ -842,6 +946,20 @@ class SageApplication(tk.Tk):
             "finished, but some files were in use and were skipped"
             if action == "permanent delete" else "cancelled or only partly completed"
         )
+        if action in {"recycle", "permanent delete"}:
+            changes = self.tree_panel.changes
+            changes.record(before or {}, after or {})
+            changes.changed.update(changed_paths)
+            self._publish_changes()
+            self.assistant_panel.write("SAGE", f"File operation {outcome}: {action}. {changes.notice()}")
+            if self._pending_size_completion is not None:
+                self._size_finished(self._pending_size_completion)
+                self._pending_size_completion = None
+            if error:
+                messagebox.showerror(APP_NAME, f"File operation failed. Some items may have changed.\n\n{error}")
+            return
+        if error:
+            self._job_failed("File operation", error)
         if requires_rescan:
             self._pending_size_completion = None
             self.assistant_panel.write("SAGE", f"File operation {outcome}: {action}. Refreshing the drive tree.")
@@ -853,6 +971,19 @@ class SageApplication(tk.Tk):
                 self._pending_size_completion = None
             elif self._result is not None and not self._result.sizes_complete:
                 self.status_var.set("Copy finished — background size analysis continues.")
+
+    def _publish_changes(self):
+        self.tree_panel.refresh_changes()
+        self.assistant_panel.disable_changed_actions(self.tree_panel.changes)
+        self._changes_var.set(self.tree_panel.changes.notice())
+        self._changes_banner.grid(row=3, column=0, sticky="ew")
+        self.status_var.set("Scan changed — refresh for current totals.")
+        # Invalidate an in-flight answer built before this operation.
+        if self._assistant_busy:
+            self._assistant_request_id += 1
+            self._conversation.cancel()
+            self._assistant_busy = False
+            self.assistant_panel.finish_reply("Files changed during this answer. Please ask again with the updated change status.")
 
     def _on_sort_changed(self, _event: object = None) -> None:
         self.tree_panel.apply_sort(SORT_MODES.get(self._sort_var.get(), "name_asc"))

@@ -549,7 +549,8 @@ class ConversationTests(unittest.TestCase):
         order=[]
         noop=lambda *args,**kwargs:None
         app=SimpleNamespace(_scan_started_at=time.monotonic(),_assistant=SimpleNamespace(set_result=noop,scan_summary=lambda:'summary'),
-            _assistant_busy=False,tree_panel=SimpleNamespace(show_result=lambda result:order.append('tree')),
+            _assistant_busy=False,_changes_banner=SimpleNamespace(grid_remove=noop),
+            tree_panel=SimpleNamespace(changes=None,show_result=lambda result:order.append('tree')),
             assistant_panel=SimpleNamespace(set_selected_item=noop,write=noop),_update_drive_info=noop,
             progress_bar=SimpleNamespace(stop=noop),scan_button=SimpleNamespace(configure=noop),_size_finished=noop)
         with patch.object(DriveIndex,'update_scan',side_effect=AssertionError('Must not index on UI thread')):
