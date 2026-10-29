@@ -114,7 +114,7 @@ class TreePanelHoverTests(unittest.TestCase):
             root_frn=5,
         )
         self.asked_path = []
-        self.panel = TreePanel(self.root, on_ask_sage=self.asked_path.append)
+        self.panel = TreePanel(self.root)
         self.panel.pack(fill="both", expand=True)
         self.panel.show_result(self.result)
         self.root.update_idletasks()
@@ -123,32 +123,19 @@ class TreePanelHoverTests(unittest.TestCase):
         if hasattr(self, "root"):
             self.root.destroy()
 
-    def test_selecting_tree_item_shows_hover_button_and_only_click_adds_context(self):
-        item_iid = "frn:10"
-        self.panel.tree.selection_set(item_iid)
-        self.panel.tree.focus(item_iid)
-
-        # Before clicking Ask SAGE, on_ask_sage has NOT been called
-        self.assertEqual(self.asked_path, [])
-
-        self.panel._update_hover_button()
+    def test_left_click_selection_does_not_create_an_ask_button(self):
+        self.panel.tree.selection_set("frn:10")
+        self.panel.tree.focus("frn:10")
+        self.panel.tree.event_generate("<<TreeviewSelect>>")
         self.root.update()
-
-        # Hover button is shown
-        self.assertTrue(self.panel._hover_button.is_visible())
+        self.assertFalse(hasattr(self.panel, "_hover_button"))
         self.assertEqual(self.asked_path, [])
 
-        # Invoking the hover button sends the folder path
-        self.panel._hover_button.invoke()
-        self.assertFalse(self.panel._hover_button.is_visible())
-        self.assertEqual(self.asked_path, ["C:\\Program Files"])
-
-    def test_clearing_or_sorting_hides_hover_button(self):
-        item_iid = "frn:10"
-        self.panel.tree.selection_set(item_iid)
-        self.panel._update_hover_button()
+    def test_clear_and_sort_work_without_a_floating_button(self):
+        self.panel.tree.selection_set("frn:10")
+        self.panel.apply_sort("allocated_desc")
         self.panel.clear()
-        self.assertFalse(self.panel._hover_button.is_visible())
+        self.assertEqual(self.panel.tree.get_children(""), ())
 
 
 class ApplicationHoverIntegrationTests(unittest.TestCase):
@@ -178,7 +165,7 @@ class ApplicationHoverIntegrationTests(unittest.TestCase):
         app = SageApplication.__new__(SageApplication)
         app._result = result
         app.assistant_panel = AssistantPanel(self.root, lambda q, quote: None)
-        app.tree_panel = TreePanel(self.root, on_ask_sage=app._on_tree_ask_sage)
+        app.tree_panel = TreePanel(self.root)
         app.tree_panel.show_result(result)
 
         # 1. User selects item in tree
@@ -187,7 +174,7 @@ class ApplicationHoverIntegrationTests(unittest.TestCase):
         # Item context is NOT set yet!
         self.assertIsNone(app.assistant_panel.get_selected_item())
 
-        # 2. User clicks "Ask SAGE" hover button on the tree
+        # 2. User chooses "Ask SAGE" from the right-click menu
         app._on_tree_ask_sage("C:\\Program Files")
         # Now context is set!
         self.assertEqual(app.assistant_panel.get_selected_item(), "C:\\Program Files")

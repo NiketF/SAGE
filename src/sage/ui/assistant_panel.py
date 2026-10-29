@@ -33,6 +33,7 @@ class AssistantPanel(ttk.Frame):
         super().__init__(parent, style="Surface.TFrame")
         self.on_question = on_question
         self._busy = False
+        self._cleanup_buttons = []
         self._reply_mark: str | None = None
         self._reply_buffer = ""
         self._render_job: str | None = None
@@ -326,9 +327,16 @@ class AssistantPanel(ttk.Frame):
                 label = "Delete contents permanently" if suggestion.contents_only else "Delete permanently"
                 btn_style = "Danger.TButton"
             button = ttk.Button(self.transcript, text=label, style=btn_style, command=lambda item=suggestion: on_delete(item))
+            self._cleanup_buttons.append((button, suggestion.path))
             self.transcript.window_create("end", window=button, pady=2)
         self.transcript.see("end")
         self.transcript.configure(state="disabled")
+
+    def disable_changed_actions(self, changes):
+        self._cleanup_buttons = [(button, path) for button, path in self._cleanup_buttons if button.winfo_exists()]
+        for button, path in self._cleanup_buttons:
+            if changes.affected(path):
+                button.configure(state="disabled", text="Changed — refresh analysis")
 
     def add_open_buttons(self, links: list[dict], on_open: Callable[[str], None]) -> None:
         """Open the Windows Settings page the reply named."""

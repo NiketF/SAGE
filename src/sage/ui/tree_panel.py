@@ -4,38 +4,37 @@ from __future__ import annotations
 
 import tkinter as tk
 from collections.abc import Callable
-from tkinter import ttk
+from tkinter import ttk, messagebox
+
+from ..services.scan_changes import ScanChanges
 
 from ..models import FileRecord, ScanResult
 from ..services.evidence import attributes_text, format_bytes
-from .floating_button import FloatingAskButton
 
 
 class TreePanel(ttk.Frame):
     COLUMNS = ("allocated", "logical", "items", "files", "folders", "attrs")
 
-    def __init__(self, parent: tk.Misc, on_sort: Callable[[str], None] | None = None, on_ask_sage: Callable[[str], None] | None = None) -> None:
+    def __init__(self, parent: tk.Misc, on_sort: Callable[[str], None] | None = None) -> None:
         super().__init__(parent, style="Surface.TFrame")
         self.result: ScanResult | None = None
+        self.changes = ScanChanges()
+        self._header_tip = None
         self._sort_mode = "name_asc"
         self._on_sort = on_sort
-        self._on_ask_sage = on_ask_sage
-        self._pending_frn: int | None = None
-        self._last_click_x = 0
-        self._update_btn_job: str | None = None
         self.folder_icon, self.file_icon, self.drive_icon = self._make_icons()
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        self.tree = ttk.Treeview(self, columns=self.COLUMNS, show="tree headings", selectmode="browse")
+        self.tree = ttk.Treeview(self, columns=self.COLUMNS, show="tree headings", selectmode="extended")
         self.tree.heading("#0", text="Name", anchor="w")
         headings = {
-            "allocated": "Space Used",
-            "logical": "File Size",
+            "allocated": "Space Used ↕",
+            "logical": "File Size ↕",
             "items": "Items",
             "files": "Files",
             "folders": "Folders",
-            "attrs": "Attr",
+            "attrs": "Attr ⓘ",
         }
         for column, label in headings.items():
             self.tree.heading(column, text=label, anchor="e" if column != "attrs" else "center")
@@ -48,14 +47,12 @@ class TreePanel(ttk.Frame):
         self.tree.column("items", width=80, anchor="e")
         self.tree.column("files", width=80, anchor="e")
         self.tree.column("folders", width=75, anchor="e")
-        self.tree.column("attrs", width=55, anchor="center")
+        self.tree.column("attrs", width=72, anchor="center")
 
         def _on_yview(*args):
-            self._hover_button.hide()
             return self.tree.yview(*args)
 
         def _on_xview(*args):
-            self._hover_button.hide()
             return self.tree.xview(*args)
 
         ybar = ttk.Scrollbar(self, orient="vertical", command=_on_yview)
@@ -65,97 +62,59 @@ class TreePanel(ttk.Frame):
         ybar.grid(row=0, column=1, sticky="ns")
         xbar.grid(row=1, column=0, sticky="ew")
 
-        self._hover_button = FloatingAskButton(self.tree, command=self._on_ask_clicked, text="Ask SAGE")
 
-        self.tree.bind("<<TreeviewOpen>>", self._on_tree_open)
-        self.tree.bind("<<TreeviewClose>>", lambda _e: self._hover_button.hide())
-        self.tree.bind("<ButtonPress-1>", self._on_tree_press)
-        self.tree.bind("<ButtonRelease-1>", self._on_tree_release)
-        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
-        self.tree.bind("<Button-3>", lambda _e: self._hover_button.hide())
-        self.tree.bind("<MouseWheel>", lambda _e: self._hover_button.hide())
-        self.tree.bind("<Escape>", lambda _e: self._hover_button.hide())
-        self.tree.bind("<Configure>", lambda _e: self._hover_button.hide())
+        self.tree.tag_configure("removed", foreground="#777777")
+        self.tree.tag_configure("changed", foreground="#9A6700")
+        self.tree.heading("attrs", command=self._show_attribute_help)
+        self.tree.bind("<Motion>", self._header_motion)
+        self.tree.bind("<Leave>", lambda _e: self._hide_header_tip())
+        self.tree.bind("<<TreeviewOpen>>", self._on_open)
 
-    def _on_tree_open(self, event: object) -> None:
-        self._hover_button.hide()
-        self._on_open(event)
+    ATTRIBUTE_HELP = ("D — Directory\nR — Read-only\nH — Hidden\nS — System\n"
+                      "A — Archive\nP — Sparse file\nL — Reparse point (link or junction)\n"
+                      "C — Compressed\nE — Encrypted\n— — None of these attributes")
 
-    def _on_tree_press(self, event: tk.Event) -> None:
-        self._last_click_x = event.x
-        self._hover_button.hide()
+    def _show_attribute_help(self):
+        messagebox.showinfo("File attributes", self.ATTRIBUTE_HELP, parent=self)
 
-    def _schedule_hover_update(self) -> None:
-        if self._update_btn_job:
-            self.after_cancel(self._update_btn_job)
-        self._update_btn_job = self.after(20, self._update_hover_button)
+    def _hide_header_tip(self):
+        if self._header_tip is not None:
+            self._header_tip.destroy()
+            self._header_tip = None
 
-    def _on_tree_release(self, _event: tk.Event) -> None:
-        self._schedule_hover_update()
+    def _header_motion(self, event):
+        column = self.tree.identify_column(event.x)
+        text = (self.ATTRIBUTE_HELP if column == "#6" else
+                "Click to sort. Click again to reverse the order." if column in {"#1", "#2"} else "")
+        if self.tree.identify_region(event.x, event.y) != "heading" or not text:
+            self._hide_header_tip()
+        elif self._header_tip is None:
+            self._header_tip = tip = tk.Toplevel(self)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{event.x_root+12}+{event.y_root+18}")
+            ttk.Label(tip, text=text, padding=8, relief="solid").pack()
+            tip._column = column
+        elif self._header_tip._column != column:
+            self._hide_header_tip()
+            self._header_motion(event)
 
-    def _on_tree_select(self, _event: object = None) -> None:
-        self._schedule_hover_update()
+    def _row_state(self, record):
+        path = self.result.path_for(record.frn) or ""
+        removed = self.changes.is_removed(path)
+        changed = self.changes.affected(path)
+        return {"text": record.name + ("  [Removed]" if removed else "  [Changed]" if changed else ""),
+                "tags": ("removed",) if removed else ("changed",) if changed else ()}
 
-    def _update_hover_button(self) -> None:
-        self._update_btn_job = None
-        if self.result is None:
-            self._hover_button.hide()
-            self._pending_frn = None
-            return
-        selected = self.tree.selection()
-        if not selected or len(selected) != 1:
-            self._hover_button.hide()
-            self._pending_frn = None
-            return
-        iid = selected[0]
-        if not iid.startswith("frn:"):
-            self._hover_button.hide()
-            self._pending_frn = None
-            return
-        frn = int(iid.split(":", 1)[1])
-        if frn == self.result.root_frn:
-            self._hover_button.hide()
-            self._pending_frn = None
-            return
-        bbox = self.tree.bbox(iid, "#0")
-        btn_w = self._hover_button.WIDTH
-        btn_h = self._hover_button.HEIGHT
-        tree_w = self.tree.winfo_width()
-        if bbox:
-            bx, by, bw, bh = bbox
-            if self._last_click_x > 0:
-                x = max(8, min(self._last_click_x - btn_w // 2, tree_w - btn_w - 20 if tree_w > btn_w else 8))
-            else:
-                x = max(8, min(bx + 30, tree_w - btn_w - 20 if tree_w > btn_w else 8))
-            y = by - btn_h - 4
-            if y < 2:
-                y = by + bh + 4
-        else:
-            x, y = 30, 8
-        self._pending_frn = frn
-        self._hover_button.show(x, y)
-
-    def _on_ask_clicked(self) -> None:
-        self._hover_button.hide()
-        if self.result and self._pending_frn is not None:
-            path = self.result.path_for(self._pending_frn)
-            if path and self._on_ask_sage:
-                self._on_ask_sage(path)
+    def refresh_changes(self):
+        self.refresh_loaded_rows()
 
     def clear(self) -> None:
-        if self._update_btn_job:
-            self.after_cancel(self._update_btn_job)
-            self._update_btn_job = None
-        self._hover_button.hide()
-        self._pending_frn = None
+        self._hide_header_tip()
         self.result = None
         self.tree.delete(*self.tree.get_children(""))
 
     def destroy(self) -> None:
-        if self._update_btn_job:
-            self.after_cancel(self._update_btn_job)
-            self._update_btn_job = None
-        self._hover_button.hide()
+        self._hide_header_tip()
         super().destroy()
 
     def selected_frns(self) -> list[int]:
@@ -183,9 +142,8 @@ class TreePanel(ttk.Frame):
         return folder, file, drive
 
     def show_result(self, result: ScanResult) -> None:
-        self._hover_button.hide()
-        self._pending_frn = None
         self.result = result
+        self.changes = ScanChanges()
         self.tree.delete(*self.tree.get_children(""))
         root = result.records[result.root_frn]
         iid = self._iid(root.frn)
@@ -215,7 +173,10 @@ class TreePanel(ttk.Frame):
                 continue
             record = self.result.records.get(frn)
             if record:
-                self.tree.item(iid, values=self._values(record))
+                state = self._row_state(record)
+                if frn == self.result.root_frn:
+                    state.pop('text')
+                self.tree.item(iid, values=self._values(record), **state)
             pending.extend(self.tree.get_children(iid))
 
     # ── Sorting ───────────────────────────────────────────────────────
@@ -230,11 +191,9 @@ class TreePanel(ttk.Frame):
 
     def apply_sort(self, mode: str) -> None:
         """Change sort mode and re-sort all currently loaded tree items."""
-        self._hover_button.hide()
-        self._pending_frn = None
         self._sort_mode = mode
         for column, field, label in (("#0", "name", "Name"), ("logical", "logical", "File Size"), ("allocated", "allocated", "Space Used")):
-            suffix = ""
+            suffix = " ↕" if field != "name" else ""
             if mode.startswith(field+"_"):
                 suffix = " \u2191" if mode.endswith("_asc") else " \u2193"
             self.tree.heading(column, text=label+suffix)
@@ -330,7 +289,7 @@ class TreePanel(ttk.Frame):
                 parent_iid,
                 "end",
                 iid=child_iid,
-                text=child.name,
+                **self._row_state(child),
                 image=self.folder_icon if child.is_directory else self.file_icon,
                 values=self._values(child),
             )
