@@ -1,3 +1,4 @@
+import threading
 import tkinter as tk
 import queue
 import unittest
@@ -120,7 +121,7 @@ class AssistantEventTests(unittest.TestCase):
         events.put(("assistant_token", 3, 11, "current text"))
         events.put(("assistant_answer", 3, 11, "current answer"))
         panel = Mock()
-        app = SimpleNamespace(_events=events, _generation=3, _assistant_request_id=11, _assistant_busy=True, assistant_panel=panel, winfo_exists=lambda: False)
+        app = SimpleNamespace(_events=events, _generation=3, _assistant_request_id=11, _assistant_busy=True, assistant_panel=panel, _conversation=SimpleNamespace(_reply_cancelled=threading.Event()), winfo_exists=lambda: False)
         SageApplication._drain_events(app)
         panel.append_reply.assert_called_once_with("current text")
         panel.finish_reply.assert_called_once_with("current answer")

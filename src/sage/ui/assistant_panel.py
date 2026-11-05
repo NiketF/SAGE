@@ -49,9 +49,12 @@ class AssistantPanel(ttk.Frame):
         self.rowconfigure(2, weight=1)
 
         # ── Section header ────────────────────────────────────────────
-        ttk.Label(self, text="Assistant", style="Section.TLabel", padding=(16, 12, 16, 10)).grid(
-            row=0, column=0, columnspan=2, sticky="ew"
-        )
+        header = ttk.Frame(self, style="Surface.TFrame")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Label(header, text="Assistant", style="Section.TLabel", padding=(16, 12, 8, 10)).pack(side="left")
+        self.model_status = tk.StringVar(value="Local AI: Loading")
+        ttk.Label(header, textvariable=self.model_status, style="SurfaceMuted.TLabel",
+                  padding=(0, 12, 16, 10)).pack(side="right")
         ttk.Separator(self, orient="horizontal").grid(row=1, column=0, columnspan=2, sticky="ew")
 
         # ── Transcript ────────────────────────────────────────────────

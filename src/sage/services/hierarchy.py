@@ -46,13 +46,15 @@ def build_scan_result(
 ) -> ScanResult:
     root_frn = find_root(records)
     children: defaultdict[int, list[int]] = defaultdict(list)
+    unresolved_frns = set()
 
     for record in records.values():
         if record.frn == root_frn:
             continue
         parent = records.get(record.parent_frn)
         if parent is None or not parent.attributes & FILE_ATTRIBUTE_DIRECTORY or record.parent_frn == record.frn:
-            record.parent_frn = root_frn
+            unresolved_frns.add(record.frn)
+            record.parent_frn = root_frn  # Display placement only, not a verified filesystem path.
         children[record.parent_frn].append(record.frn)
 
     result = ScanResult(
@@ -60,6 +62,7 @@ def build_scan_result(
         records=records,
         children=dict(children),
         root_frn=root_frn,
+        unresolved_frns=unresolved_frns,
         skipped_records=skipped_records,
     )
     calculate_stats(result, include_sizes=include_sizes)

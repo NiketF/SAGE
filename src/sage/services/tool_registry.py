@@ -55,12 +55,22 @@ class ToolRegistry:
         self._uninstall_actions={}
         self._children_cache={}
         self._cleanup_cache=None
+        self._scoped_cleanup_cache={}
         self.scan_changes = None
 
-    def cleanup_suggestions(self):
+    def cleanup_suggestions(self, scope=None, limit=12):
         if not self.evidence or not self.evidence.result.sizes_complete:return []
-        if self._cleanup_cache is None:self._cleanup_cache=find_cleanup_suggestions(self.evidence.result)
-        return [s for s in self._cleanup_cache if not self.scan_changes or not self.scan_changes.affected(s.path)]
+        root = self.evidence.result.volume.drive + '\\'
+        if scope is None or ntpath.normcase(ntpath.normpath(scope)) == ntpath.normcase(root):
+            if self._cleanup_cache is None:self._cleanup_cache=find_cleanup_suggestions(self.evidence.result)
+            items = self._cleanup_cache
+        else:
+            key = (ntpath.normcase(ntpath.normpath(scope)), limit)
+            if key not in self._scoped_cleanup_cache:
+                if len(self._scoped_cleanup_cache) >= 32:self._scoped_cleanup_cache.clear()
+                self._scoped_cleanup_cache[key] = find_cleanup_suggestions(self.evidence.result,limit=limit,scope=scope)
+            items = self._scoped_cleanup_cache[key]
+        return [s for s in items if not self.scan_changes or not self.scan_changes.affected(s.path)][:limit]
 
     def validate(self, name: str, arguments: dict) -> None:
         if not isinstance(arguments,dict):
@@ -232,8 +242,8 @@ class ToolRegistry:
         if name == 'cleanup_candidates':
             if not self.evidence:
                 return {'items':[]}
-            items=self.cleanup_suggestions()
             scope=arguments['scope']
+            items=self.cleanup_suggestions(scope,arguments.get('limit',8))
             return {'items':[{'path':s.path,'space':format_bytes(s.allocated),'reason':s.reason,'conditions':s.title}
                              for s in items if self.evidence.within(s.path,scope)][:arguments.get('limit',8)],'read_only':True,
                     'optional_applications':self._optional_applications(scope,arguments.get('limit',8)),

@@ -7,7 +7,7 @@ import time
 from sage.config import FILE_ATTRIBUTE_DIRECTORY
 from sage.models import FileRecord, VolumeInfo
 from sage.services.hierarchy import build_scan_result, calculate_directory_sizes
-from sage.services.local_ai import ConversationAssistant
+from sage.services.conversation import DriveAssistant as ConversationAssistant
 
 
 def fixture():

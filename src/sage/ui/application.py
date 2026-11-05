@@ -86,11 +86,12 @@ class SageApplication(tk.Tk):
         self._drive_refresh_active = False
         self._drive_refresh_closed = False
 
+        self._ai_status_job = None
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(50, self._drain_events)
         self.after(200, self._bring_to_front)
-        self.after(300, self._warm_ai)
+        self._warm_ai()
         self._load_volumes()
         self._drive_refresh_job = self.after(400, self._refresh_drive_space)
 
@@ -98,14 +99,23 @@ class SageApplication(tk.Tk):
         self.assistant_panel.set_status("Loading local AI…")
 
         def worker() -> None:
+            client = OllamaClient()
             try:
-                OllamaClient().warm([{'role':'system','content':self._conversation.system_prompt()}])
+                client.warm([{'role':'system','content':self._conversation.system_prompt()}])
                 status = "Ready for your question."
             except RuntimeError as exc:
                 status = f"Local AI unavailable: {exc}"
-            self._events.put(("ai_ready", self._generation, status))
+            self._events.put(("ai_status", client.ready(), status))
 
         threading.Thread(target=worker, daemon=True, name="sage-ai-warmup").start()
+
+    def _refresh_ai_status(self) -> None:
+        self._ai_status_job = None
+
+        def worker() -> None:
+            self._events.put(("ai_status", OllamaClient().ready(), None))
+
+        threading.Thread(target=worker, daemon=True, name="sage-ai-status").start()
 
     def _bring_to_front(self) -> None:
         """Make the post-UAC window visible instead of leaving it behind the caller."""
@@ -313,6 +323,13 @@ class SageApplication(tk.Tk):
         try:
             while True:
                 event = self._events.get_nowait()
+                if event[0] == "ai_status":
+                    _, ready, startup_status = event
+                    self.assistant_panel.model_status.set("Local AI: Online" if ready else "Local AI: Offline")
+                    if startup_status and not self._assistant_busy:
+                        self.assistant_panel.set_status(startup_status)
+                    self._ai_status_job = self.after(5000, self._refresh_ai_status)
+                    continue
                 if event[0] == "drive_space":
                     self._drive_capacity = event[1]
                     self._drive_refresh_active = False
@@ -325,6 +342,8 @@ class SageApplication(tk.Tk):
                     continue
                 kind = event[0]
                 if kind.startswith("assistant_") and event[2] != self._assistant_request_id:
+                    continue
+                if kind in {"assistant_token", "assistant_status", "assistant_reset"} and self._conversation._reply_cancelled.is_set():
                     continue
                 if kind == "mft_progress":
                     _, _, count, fraction = event
@@ -404,9 +423,6 @@ class SageApplication(tk.Tk):
                     self.assistant_panel.reset_reply()
                 elif kind == "assistant_status":
                     self.assistant_panel.set_status(event[3])
-                elif kind == "ai_ready":
-                    if not self._assistant_busy:
-                        self.assistant_panel.set_status(event[2])
                 elif kind == "index_progress":
                     if not self._assistant_busy:
                         if event[2]>=event[3]:
@@ -980,10 +996,9 @@ class SageApplication(tk.Tk):
         self.status_var.set("Scan changed — refresh for current totals.")
         # Invalidate an in-flight answer built before this operation.
         if self._assistant_busy:
-            self._assistant_request_id += 1
-            self._conversation.cancel()
-            self._assistant_busy = False
-            self.assistant_panel.finish_reply("Files changed during this answer. Please ask again with the updated change status.")
+            self._conversation.cancel_reply()
+            self.assistant_panel.reset_reply()
+            self.assistant_panel.set_status("Stopping the answer after file changes…")
 
     def _on_sort_changed(self, _event: object = None) -> None:
         self.tree_panel.apply_sort(SORT_MODES.get(self._sort_var.get(), "name_asc"))
@@ -1086,4 +1101,6 @@ class SageApplication(tk.Tk):
         self._conversation.cancel()
         if self._drive_refresh_job is not None:
             self.after_cancel(self._drive_refresh_job)
+        if self._ai_status_job is not None:
+            self.after_cancel(self._ai_status_job)
         self.destroy()

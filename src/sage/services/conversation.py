@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-from .local_ai import OllamaClient, ConversationAssistant as LegacyAssistant, settings_links, OLLAMA_RESPONSE_TIMEOUT_SECONDS
+from .local_ai import OllamaClient, ConversationAssistant as LegacyAssistant, settings_links, OLLAMA_RESPONSE_TIMEOUT_SECONDS, OLLAMA_STARTUP_WAIT_SECONDS
 from .local_database import DriveIndex
 from .retrieval import ScanEvidence
 from .tool_registry import ToolRegistry, FACT_FIELDS
@@ -93,9 +93,9 @@ def compact(value):
                 and not (key=='cleanup_risk' and (value.get('windows_assessment') or item.get('risk') in {'unknown','unverified','review'}))
                 and key not in {'frn','logical_bytes','allocated_bytes','role_basis','observed_children','size_error','logical_display','modified_time'}}
     if isinstance(value,list):
-        return [compact(item) for item in value[:8]]
+        return [compact(item) for item in value]
     if isinstance(value,str):
-        return value[:1200]
+        return value if ntpath.isabs(value) else value[:1200]
     return value
 
 
@@ -158,6 +158,7 @@ class DriveAssistant:
         self.last_links=[]
         self.last_timings={}
         self.last_context={}
+        self._reply_cancelled=threading.Event()
         self._index_cancel=threading.Event()
         self._index_generation=0
         self.index_status='not started'
@@ -193,6 +194,11 @@ class DriveAssistant:
         thread.start()
         return thread
 
+    def cancel_reply(self):
+        """Stop this answer without cancelling the scan index or future questions."""
+        self._reply_cancelled.set()
+        self.client.cancel()
+
     def cancel(self):
         self._index_cancel.set()
         self.client.cancel()
@@ -212,6 +218,10 @@ class DriveAssistant:
         self.listed=[{'path':s.path} for s in suggestions]
 
     def _finish(self,question,reply,started,on_token):
+        if self._reply_cancelled.is_set():
+            self.last_timings['status']='cancelled'
+            self.last_timings['total_seconds']=round(time.monotonic()-started,3)
+            return 'Files changed during this answer. Please ask again with the updated change status.'
         reply=clean_reply(reply)
         self.last_timings['total_seconds']=round(time.monotonic()-started,3)
         self.history.append({'role':'user','content':question})
@@ -241,7 +251,7 @@ class DriveAssistant:
             return f'{paths} was not verified in this scan. Check the requested paths or scan their drive before an assessment.'
         if 'loading' in reason.lower():
             return 'The local AI is still loading. Wait for the Ready status, then send the question again.'
-        if 'budget' in reason.lower() or 'timeout' in reason.lower() or 'timed out' in reason.lower() or 'time limit' in reason.lower():
+        if 'budget' in reason.lower() or 'timeout' in reason.lower() or 'timed out' in reason.lower() or 'stopped responding for' in reason.lower() or 'time limit' in reason.lower():
             return 'The answer did not finish within the response time limit. Please send the question again.'
         if 'Unverified response path' in reason:
             return 'The answer included a path that was not verified in this scan. I could not complete its assessment.'
@@ -250,6 +260,9 @@ class DriveAssistant:
         return 'The local AI did not produce a complete, verified answer to this question. Please send the question again.'
 
     def answer(self,question,selected_paths=(),*,quoted='',on_token=None,on_status=None,on_reset=None):
+        if self._reply_cancelled.is_set():
+            self.client=OllamaClient(model=self.client.model,transport=self.client.transport)
+            self._reply_cancelled.clear()
         started=time.monotonic()
         deadline=started+OLLAMA_RESPONSE_TIMEOUT_SECONDS
         self.last_suggestions=[]
@@ -260,6 +273,10 @@ class DriveAssistant:
         streamed=False
         displayed=''
         def finish(text):
+            if self._reply_cancelled.is_set():
+                self.focus=previous_focus
+                self.tools.focus=list(previous_focus)
+                return self._finish(question,'',started,None)
             text=clean_reply(text)
             if on_token and streamed and text.startswith(displayed):
                 on_token(text[len(displayed):])
@@ -281,8 +298,9 @@ class DriveAssistant:
             except ValueError:
                 if references:
                     self.unresolved_paths.append(path);continue
+                # A stale optional selection must not decide the new question.
                 self.focus=[];self.tools.focus=[];self.listed=[]
-                return finish(f'`{path}` is not in the current scan. Check the path or scan the drive that contains it.')
+                continue
         verified_references=bool(items and references)
         if items: self.focus=[item['path'] for item in items]
         if not items and self.focus and self.evidence and not references:
@@ -326,7 +344,7 @@ class DriveAssistant:
             for frn in dict.fromkeys(frns):
                 record=self.result.records[frn]
                 name=''.join(re.findall(r'\w+',record.name.casefold()))
-                if name and name in phrases:matches.append(self.evidence._entry(record))
+                if name and name in phrases and self.result.path_for(frn) is not None:matches.append(self.evidence._entry(record))
             candidates={'items':matches[:8],'exact':True,'match_type':'literal neighbourhood hints; not exhaustive'}
             context['named_candidates']={'match_type':candidates.get('match_type'),
                 'items':[{'path':row['path'],'kind':row['kind']} for row in candidates.get('items',[])],
@@ -357,9 +375,9 @@ class DriveAssistant:
         if self.client.transport is None and self.client.loading.is_set():
             if on_status:on_status('Waiting for local AI startup… Your question is queued.')
             waiting=time.monotonic()
-            if not self.client.wait_for_warm(60):
+            if not self.client.wait_for_warm(OLLAMA_STARTUP_WAIT_SECONDS):
                 self.last_timings['status']='loading_fallback'
-                return finish(self._fallback(items,'Model startup exceeded the response time budget.'))
+                return finish(self._fallback(items,'The local model is still loading.'))
             wait_seconds=time.monotonic()-waiting
             self.last_timings['startup_wait_seconds']=round(wait_seconds,3)
             deadline+=wait_seconds
@@ -444,6 +462,7 @@ class DriveAssistant:
                 decoded_length=0
                 def receive(piece):
                     nonlocal buffer,streamed,displayed,raw_stream,decoded_length
+                    if self._reply_cancelled.is_set():raise RuntimeError("Answer cancelled after file changes.")
                     self.last_timings.setdefault('first_token_seconds',round(time.monotonic()-started,3))
                     raw_stream+=piece
                     prose=raw_stream
@@ -467,13 +486,11 @@ class DriveAssistant:
                         rest=prose[prefix.end()+end:].lstrip()
                         if not rest.startswith(','):return
                         prose='{'+rest[1:]
-                    elif self.client.transport is None:
-                        # Legacy forms remain accepted, but without subject metadata
-                        # their prose cannot be safely displayed before validation.
+                    else:
+                        # Prose needs a declared subject before it can be streamed.
                         return
                     decoded=answer_text(prose)
-                    if self.client.transport is None and field_text(raw_stream,'purpose') is None:return
-                    if decoded is None and self.client.transport is not None and not raw_stream.lstrip().startswith('{'):decoded=raw_stream
+                    if field_text(raw_stream,'purpose') is None:return
                     if decoded is None:return
                     buffer+=decoded[decoded_length:]
                     decoded_length=len(decoded)
@@ -500,7 +517,7 @@ class DriveAssistant:
                     try:complete_object=isinstance(json.loads(raw,object_pairs_hook=unique_object),dict)
                     except ValueError:pass
                 limited=self.client.last_metrics.get('done_reason')=='length'
-                malformed=self.client.transport is None and not message.get('tool_calls') and not complete_object
+                malformed=not message.get('tool_calls') and not complete_object
                 if malformed or (limited and not complete_object):
                     if turn==2:raise ValueError('The model did not complete its response format.')
                     # Completion metadata alone must not discard a complete JSON
@@ -516,7 +533,7 @@ class DriveAssistant:
                     data=json.loads(raw,object_pairs_hook=unique_object)
                     if not isinstance(data,dict):raise ValueError('Invalid response object.')
                     self.last_timings['response_fields']=sorted(data)
-                    if self.client.transport is None and not {'intent','subject'}<=set(data):
+                    if not {'intent','subject'}<=set(data):
                         raise ValueError('The model did not identify the response subject.')
                     intent=data.pop('intent',None)
                     if intent is not None and intent not in {'conversation','fact','assessment'}:raise ValueError('Invalid response intent.')
@@ -563,8 +580,6 @@ class DriveAssistant:
                     if set(data)=={'purpose','answer'} and isinstance(data['purpose'],str) and isinstance(data['answer'],str) and (data['purpose'].strip() or data['answer'].strip()):
                         separator='\n\n' if '\n' in data['answer'] or data['answer'].lstrip().startswith(('- ','* ')) else ' '
                         message={'content':data['purpose'].strip()+separator+data['answer'].strip()}
-                    elif set(data)=={'answer'} and isinstance(data['answer'],str) and self.client.transport is not None:
-                        message={'content':data['answer']}
                     elif 'fact' in data and set(data)<= {'fact','path'}:
                         args={'field':data['fact'],'final':intent!='assessment'}
                         if 'path' in data:args['path']=data['path']
@@ -576,7 +591,7 @@ class DriveAssistant:
                         calls=[{'function':{'name':call.get('name'),'arguments':call.get('args')}} for call in data['calls'] if isinstance(call,dict)]
                         if len(calls)!=len(data['calls']):raise ValueError('Invalid lookup object.')
                     else:raise ValueError('Invalid response fields.')
-                elif not calls and self.client.transport is None:
+                elif not calls:
                     raise ValueError('Expected a JSON response.')
                 if not isinstance(calls,list) or len(calls)>3:
                     raise ValueError('Invalid tool request count.')

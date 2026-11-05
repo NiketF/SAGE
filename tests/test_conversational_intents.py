@@ -43,7 +43,7 @@ class ConversationalIntentTests(unittest.TestCase):
             'Documents/report.docx': 20000,
         }, drive='D:')
         self.transport_calls = []
-        self.model_reply={'subject':None,'purpose':'This item needs review.','answer':'Check its use before removal.'}
+        self.model_reply={'intent': 'assessment', 'subject':None,'purpose':'This item needs review.','answer':'Check its use before removal.'}
 
         def transport(payload):
             self.transport_calls.append(payload)
@@ -58,7 +58,7 @@ class ConversationalIntentTests(unittest.TestCase):
         for g in greetings:
             with self.subTest(greeting=g):
                 self.transport_calls.clear()
-                self.model_reply={'subject':None,'purpose':'Hello!','answer':'How can I help with your storage?'}
+                self.model_reply={'intent': 'assessment', 'subject':None,'purpose':'Hello!','answer':'How can I help with your storage?'}
                 reply = self.assistant.answer(g, (r'D:\Games',))
                 self.assertIn('Hello!', reply)
                 self.assertNotIn('Game files',reply)
@@ -80,7 +80,7 @@ class ConversationalIntentTests(unittest.TestCase):
         for query in off_topic_queries:
             with self.subTest(query=query):
                 self.transport_calls.clear()
-                self.model_reply={'subject':None,'purpose':'I help with computing and storage.','answer':'Ask me about your files or drives.'}
+                self.model_reply={'intent': 'assessment', 'subject':None,'purpose':'I help with computing and storage.','answer':'Ask me about your files or drives.'}
                 reply = self.assistant.answer(query, (r'D:\Games',))
                 self.assertIn('computing and storage', reply)
                 self.assertNotIn('game.exe', reply)
@@ -96,12 +96,12 @@ class ConversationalIntentTests(unittest.TestCase):
         self.assertEqual(self.assistant.last_suggestions, [])
 
     def test_non_existent_named_file_cleanly_reported(self):
-        self.model_reply={'subject':None,'purpose':'No verified match was returned for fake_document.pdf.',
+        self.model_reply={'intent': 'assessment', 'subject':None,'purpose':'No verified match was returned for fake_document.pdf.',
                           'answer':'The retained scan cannot establish whether an unscanned copy exists.'}
         calls=[]
         def respond(payload):
             calls.append(payload)
-            reply={'subject':'fake_document.pdf','calls':[{'name':'search_files','args':{'query':'fake_document.pdf'}}]} if len(calls)==1 else self.model_reply
+            reply={'intent': 'assessment', 'subject':'fake_document.pdf','calls':[{'name':'search_files','args':{'query':'fake_document.pdf'}}]} if len(calls)==1 else self.model_reply
             return {'message':{'content':json.dumps(reply)}}
         self.client.transport=respond
         reply=self.assistant.answer('Can I delete fake_document.pdf?',(r'D:\Games',))
@@ -111,19 +111,19 @@ class ConversationalIntentTests(unittest.TestCase):
         self.assertTrue(any(row['name']=='search_files' and not row['result'].get('items') for row in self.assistant.last_context['lookups']))
 
     def test_existing_named_file_in_selected_folder_is_inspected(self):
-        self.model_reply={'subject':'photo.jpg','purpose':'This is an image file.','answer':'Review whether you need it.'}
+        self.model_reply={'intent': 'assessment', 'subject':'photo.jpg','purpose':'This is an image file.','answer':'Review whether you need it.'}
         reply = self.assistant.answer('Can I delete photo.jpg?', (r'D:\Games',))
         self.assertNotIn('does not exist', reply)
         self.assertEqual(self.assistant.focus, [r'D:\Games\photo.jpg'])
 
     def test_suggestions_not_attached_on_pure_fact_queries(self):
         # User asking about size or content without cleanup intent
-        self.model_reply={'subject':r'D:\Games','fact':'size'}
+        self.model_reply={'intent': 'fact', 'subject':r'D:\Games','fact':'size'}
         self.assistant.answer('How big is this folder?',(r'D:\Games',))
         self.assertEqual(self.assistant.last_suggestions,[])
 
     def test_suggestions_require_an_explicit_model_action(self):
-        self.model_reply={'subject':r'D:\Games','purpose':'This holds games.','answer':'Review what you still play.'}
+        self.model_reply={'intent': 'assessment', 'subject':r'D:\Games','purpose':'This holds games.','answer':'Review what you still play.'}
         self.assistant.answer('What can I delete here?',(r'D:\Games',))
         self.assertEqual(self.assistant.last_suggestions,[])
 
@@ -137,18 +137,18 @@ class ConversationalIntentTests(unittest.TestCase):
         assistant = DriveAssistant(c_scan, self.client, self.index)
 
         # 1. Active selection is ProgramData, but user asks about Program Files
-        self.model_reply={'subject':r'C:\Program Files','purpose':'This holds applications.','answer':'Use their uninstallers if no longer needed.'}
+        self.model_reply={'intent': 'assessment', 'subject':r'C:\Program Files','purpose':'This holds applications.','answer':'Use their uninstallers if no longer needed.'}
         assistant.answer('can i delete program files?', (r'C:\ProgramData',))
         self.assertEqual(assistant.focus, [r'C:\Program Files'])
 
         # 2. Active selection is Program Files, user asks about Fraps
-        self.model_reply={'subject':r'C:\Fraps','purpose':'This holds an executable.','answer':'Its active use is not verified.'}
+        self.model_reply={'intent': 'assessment', 'subject':r'C:\Fraps','purpose':'This holds an executable.','answer':'Its active use is not verified.'}
         reply = assistant.answer('what is inside Fraps?', (r'C:\Program Files',))
         self.assertEqual(assistant.focus, [r'C:\Fraps'])
         self.assertNotIn('storage and drive analysis assistant', reply)
 
         # 3. Active selection is Fraps, user asks about Games
-        self.model_reply={'subject':r'C:\Games','purpose':'This holds game files.','answer':'Review whether you still need them.'}
+        self.model_reply={'intent': 'assessment', 'subject':r'C:\Games','purpose':'This holds game files.','answer':'Review whether you still need them.'}
         reply = assistant.answer('what is inside games can i delete it?', (r'C:\Fraps',))
         self.assertEqual(assistant.focus, [r'C:\Games'])
         self.assertNotIn('Program Files', reply)
@@ -160,7 +160,7 @@ class ConversationalIntentTests(unittest.TestCase):
         }, drive='C:')
         assistant = DriveAssistant(c_scan, self.client, self.index)
 
-        self.model_reply={'subject':r'C:\PerfLogs','purpose':'This contains logs.','answer':'Check whether you need the records.'}
+        self.model_reply={'intent': 'assessment', 'subject':r'C:\PerfLogs','purpose':'This contains logs.','answer':'Check whether you need the records.'}
         assistant.answer('can i delete perflogs',(r'C:\Program Files (x86)',))
         self.assertEqual(assistant.focus,[r'C:\PerfLogs'])
         self.assertEqual(assistant.last_suggestions,[])

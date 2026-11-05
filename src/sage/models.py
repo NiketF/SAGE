@@ -58,6 +58,8 @@ class ScanResult:
         default_factory=lambda: datetime.now(timezone.utc)
     )
 
+    unresolved_frns: set[int] = field(default_factory=set)
+
     def path_for(self, frn: int) -> str | None:
         """Build a path without following the filesystem recursively."""
         if frn == self.root_frn:
@@ -65,13 +67,14 @@ class ScanResult:
 
         parts: list[str] = []
         seen: set[int] = set()
+        unresolved = self.unresolved_frns
         current = frn
         while current != self.root_frn:
             if current in seen:
                 return None
             seen.add(current)
             record = self.records.get(current)
-            if record is None:
+            if record is None or (unresolved and current in unresolved):
                 return None
             parts.append(record.name)
             current = record.parent_frn

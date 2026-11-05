@@ -507,6 +507,8 @@ class ScanEvidence:
     def _entry(self, record: FileRecord) -> dict:
         result = self.result
         path = result.path_for(record.frn)
+        if path is None:
+            return {"error": "This retained record has an unresolved path.", "name": record.name}
         logical, allocated = (
             result.directory_sizes.get(record.frn, (0, 0))
             if record.is_directory else (record.logical_size, record.allocated_size)
@@ -552,6 +554,9 @@ class ScanEvidence:
                     continue
                 seen.add(frn)
                 record = result.records[frn]
+                # Unresolved display placement does not establish a real path.
+                if result.unresolved_frns and result.path_for(frn) is None:
+                    continue
                 # Do not rank or traverse junctions as though they were ordinary folders.
                 if record.attributes & 0x400:
                     continue
@@ -600,7 +605,8 @@ class ScanEvidence:
         for part in requested[len(result.volume.drive) + 1:].split("\\"):
             current = next(
                 (frn for frn in result.children.get(current, ())
-                 if frn in result.records and ntpath.normcase(result.records[frn].name) == part),
+                 if frn in result.records and ntpath.normcase(result.records[frn].name) == part
+                 and result.path_for(frn) is not None),
                 None,
             )
             if current is None:

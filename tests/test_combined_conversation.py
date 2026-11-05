@@ -26,7 +26,7 @@ class CombinedConversationTests(unittest.TestCase):
         received=[]
         def respond(payload):
             received.append(json.loads(json.dumps(payload)))
-            return {'message':{'content':json.dumps({'subject':r'E:\Runner','purpose':'This folder contains model data.',
+            return {'message':{'content':json.dumps({'intent': 'assessment', 'subject':r'E:\Runner','purpose':'This folder contains model data.',
                  'answer':'Review whether the models are still needed before removing them.'})}}
         a=self.assistant(respond);a.focus=[r'E:\Courses']
         reply=a.answer('Can I delete Runner?',(r'E:\Courses',))
@@ -36,7 +36,7 @@ class CombinedConversationTests(unittest.TestCase):
         self.assertTrue(hinted['tree_access']['all_retained_descendants_retrievable'])
         self.assertEqual(a.focus,[r'E:\Runner']);self.assertEqual(a.last_timings['model_calls'],1)
         self.assertNotIn('No file was changed',reply)
-        a.client.transport=lambda _: {'message':{'content':'{"subject":"E:\\\\Runner","fact":"size"}'}}
+        a.client.transport=lambda _: {'message':{'content':'{"intent": "fact", "subject": "E:\\\\Runner", "fact": "size"}'}}
         self.assertIn('100 B',a.answer('How big is it?',(r'E:\Courses',)))
 
     def test_subject_is_required_but_three_response_forms_remain(self):
@@ -46,7 +46,7 @@ class CombinedConversationTests(unittest.TestCase):
         self.assertTrue(all('subject' in form['required'] for form in forms))
 
     def test_greetings_remain_model_written_without_whole_drive_lookup(self):
-        a=self.assistant(lambda _: {'message':{'content':'{"subject":null,"purpose":"Hello!","answer":"How can I help?"}'}})
+        a=self.assistant(lambda _: {'message':{'content':'{"intent": "assessment", "subject": null, "purpose": "Hello!", "answer": "How can I help?"}'}})
         with (patch.object(a.evidence,'resolve_name',side_effect=AssertionError('No subject lookup')),
               patch.object(a.evidence,'mentioned',side_effect=AssertionError('No full metadata walk'))):
             reply=a.answer('Hello')
@@ -94,7 +94,7 @@ class CombinedConversationTests(unittest.TestCase):
         def respond(payload):
             calls.append(payload)
             if len(calls)==1:return {'message':{'content':'{"subject":null,"purpose":"Incomplete'},'done_reason':'length'}
-            return {'message':{'content':'{"subject":null,"purpose":"RAM holds working data.","answer":"Its contents are temporary."}'},'done_reason':'stop'}
+            return {'message':{'content':'{"intent": "assessment", "subject": null, "purpose": "RAM holds working data.", "answer": "Its contents are temporary."}'},'done_reason':'stop'}
         a=self.assistant(respond)
         reply=a.answer('Explain RAM')
         self.assertEqual(len(calls),2);self.assertEqual(a.last_timings['model_calls'],2)
@@ -105,7 +105,7 @@ class CombinedConversationTests(unittest.TestCase):
         apps=[{'name':'Editor','location':r'C:\Apps\Editor','registered_location':r'C:\Apps\Editor','uninstall_string':r'"C:\Apps\Editor\uninstall.exe"'},
               {'name':'Inferred','location':r'C:\Apps\Inferred','uninstall_string':r'C:\unknown.exe'},
               {'name':'Service','location':r'C:\Windows\Service','registered_location':r'C:\Windows\Service','uninstall_string':r'C:\service.exe'}]
-        def respond(_):return {'message':{'content':json.dumps({'subject':r'C:\Apps','purpose':'This contains application folders.',
+        def respond(_):return {'message':{'content':json.dumps({'intent': 'assessment', 'subject':r'C:\Apps','purpose':'This contains application folders.',
              'answer':r'Consider uninstalling `C:\Apps\Editor` if you no longer need it. Preserve needed data first.',
              'uninstall_paths':[r'C:\Apps\Editor',r'C:\Apps\Inferred']})}}
         a=self.assistant(respond,result)
@@ -127,7 +127,7 @@ class CombinedConversationTests(unittest.TestCase):
             self.assertNotIn('shell',launch.call_args.kwargs)
 
     def test_fact_queries_persist_fresh_values(self):
-        a=self.assistant(lambda _: {'message':{'content':'{"subject":"E:\\\\Courses","fact":"files"}'}})
+        a=self.assistant(lambda _: {'message':{'content':'{"intent": "fact", "subject": "E:\\\\Courses", "fact": "files"}'}})
         self.assertIn('1 files',a.answer('How many files are in Courses?'))
         self.assertTrue(Path(self.index.db_path).with_name('index-facts.sqlite3').exists())
 

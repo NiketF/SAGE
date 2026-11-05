@@ -228,8 +228,8 @@ class DriveIndex:
         term = query.strip()
         if not term:
             return []
-        where = "(name LIKE ? OR path LIKE ?)"
-        params: list[object] = [f"%{term}%", f"%{term}%"]
+        where = "(instr(casefold(name), ?) > 0 OR instr(casefold(path), ?) > 0)"
+        params: list[object] = [term.casefold(), term.casefold()]
         if scope:
             where += " AND instr(casefold(path), ?) = 1"
             params.append(ntpath.normpath(scope).rstrip("\\").casefold() + "\\")
@@ -322,7 +322,7 @@ class DriveIndex:
                 """
                 SELECT path, name, is_directory, logical_bytes, allocated_bytes, modified_time
                 FROM files
-                WHERE parent_path = ?
+                WHERE casefold(parent_path) = casefold(?)
                 ORDER BY is_directory DESC, allocated_bytes DESC, name ASC
                 LIMIT ?
                 """,
@@ -333,7 +333,7 @@ class DriveIndex:
     def summarize_folder(self, path: str) -> dict:
         self.ensure_schema()
         normalized = ntpath.normpath(path).rstrip("\\")
-        prefix = normalized + "\\%"
+        prefix = normalized.casefold() + "\\"
         with self._connect() as conn:
             direct = conn.execute(
                 """
@@ -341,7 +341,7 @@ class DriveIndex:
                     SUM(CASE WHEN is_directory = 1 THEN 1 ELSE 0 END) AS direct_folders,
                     SUM(CASE WHEN is_directory = 0 THEN 1 ELSE 0 END) AS direct_files
                 FROM files
-                WHERE parent_path = ?
+                WHERE casefold(parent_path) = casefold(?)
                 """,
                 (normalized,),
             ).fetchone()
@@ -351,7 +351,7 @@ class DriveIndex:
                     COUNT(*) AS total_items,
                     SUM(CASE WHEN is_directory = 0 THEN allocated_bytes ELSE 0 END) AS total_allocated
                 FROM files
-                WHERE path = ? OR path LIKE ?
+                WHERE casefold(path) = casefold(?) OR instr(casefold(path), ?) = 1
                 """,
                 (normalized, prefix),
             ).fetchone()

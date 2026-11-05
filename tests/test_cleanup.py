@@ -102,7 +102,7 @@ class CleanupSuggestionTests(unittest.TestCase):
 
         assistant = ConversationAssistant(cleanup_scan(), OllamaClient(transport=forbidden))
         answer = assistant.answer("I want to clear some space in c drive, which files are safe to delete")
-        self.assertIn("You can free about", answer)
+        self.assertIn("Review these", answer)
         self.assertEqual(len(assistant.last_suggestions), 5)
 
     def test_verified_cache_under_windows_is_not_refused(self):
@@ -161,12 +161,12 @@ class ScopedQuestionTests(unittest.TestCase):
 
     def test_quoted_suggestion_ignores_protected_tree_selection(self):
         assistant, payloads = self._assistant()
-        quote = "2. 250.0 MB C:\\Users\\hp\\Downloads\\tool-setup.exe Installer in Downloads."
+        quote = "2. 250.0 MB C:\\Users\\hp\\Downloads\\tool-setup.exe Executable or disk image in Downloads."
         answer = assistant.answer("Is this really safe to delete?", ("C:\\Program Files",), quoted=quote)
         self.assertNotIn("Do not directly delete", answer)
         context = self._context(payloads[0])
         self.assertEqual(context["selected_items"], [])
-        self.assertIn("Installer in Downloads", context["matched_items"][0]["verified_cleanup"])
+        self.assertIn("Executable or disk image in Downloads", context["matched_items"][0]["verified_cleanup"])
 
     def test_every_suggestion_reaches_the_model_and_escaped_paths_are_fixed(self):
         payloads = []

@@ -8,6 +8,7 @@ import shutil
 import stat
 import sys
 from ctypes import wintypes
+from contextlib import contextmanager
 
 FO_MOVE = 0x0001
 FO_COPY = 0x0002
@@ -96,7 +97,56 @@ def shell_file_operation(
             ole32.CoUninitialize()
 
 
+@contextmanager
+def _cleanup_path(path: str, contents_only: bool):
+    """Pin directory ancestry against rename/replacement; reject reparse points."""
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int,
+        wintypes.LPVOID, wintypes.DWORD]
+    kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handles = []
+    current = path if contents_only else os.path.dirname(path)
+    directories = []
+    while True:
+        directories.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    try:
+        for directory in reversed(directories):
+            # OPEN_REPARSE_POINT inspects the link itself. Omitting SHARE_DELETE
+            # keeps every inspected ancestor fixed until this operation finishes.
+            native = directory if directory.startswith('\\\\?\\') else '\\\\?\\' + directory
+            handle = kernel.CreateFileW(native, 0x81, 0x3, None, 3, 0x02200000, None)
+            if handle == ctypes.c_void_p(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error(), f'Cannot open cleanup directory: {directory}')
+            handles.append(handle)
+            attributes = (wintypes.DWORD * 2)()
+            if not kernel.GetFileInformationByHandleEx(handle, 9, attributes, ctypes.sizeof(attributes)):
+                raise ctypes.WinError(ctypes.get_last_error(), f'Cannot inspect cleanup directory: {directory}')
+            if attributes[0] & 0x400 or not attributes[0] & 0x10:
+                raise OSError('Cleanup requires an ordinary directory path without links or junctions.')
+        yield
+    finally:
+        for handle in reversed(handles):
+            kernel.CloseHandle(handle)
+
+
 def delete_permanently(path: str, contents_only: bool = False) -> int:
+    """Validate and hold the target's directory path before permanent cleanup."""
+    absolute = os.path.abspath(path)
+    if not os.path.isabs(path) or '\0' in path or not os.path.splitdrive(absolute)[1].strip('\\/'):
+        raise ValueError('Refusing to delete a drive root, relative path, or invalid path.')
+    with _cleanup_path(absolute, contents_only):
+        return _delete_permanently(absolute, contents_only)
+
+
+def _delete_permanently(path: str, contents_only: bool = False) -> int:
     """Delete without the Recycle Bin; return how many items could not be removed.
 
     Files in use are skipped. Symlinks and junctions are removed, never followed.

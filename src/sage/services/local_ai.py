@@ -41,6 +41,9 @@ MODEL_NAME = "qwen3.5:4b"
 OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"
 OLLAMA_TIMEOUT_SECONDS = 30  # Connection/read inactivity, not healthy-stream duration.
 OLLAMA_RESPONSE_TIMEOUT_SECONDS = 120  # Safety ceiling; never a response-time target.
+OLLAMA_MODEL_LOAD_TIMEOUT_SECONDS = 90
+# Server startup, model metadata, and at most two placement attempts.
+OLLAMA_STARTUP_WAIT_SECONDS = 2 * OLLAMA_MODEL_LOAD_TIMEOUT_SECONDS + 10
 MODEL_TARGET_SECONDS = 15
 
 SYSTEM_INSTRUCTIONS = (
@@ -283,13 +286,15 @@ class OllamaClient:
         message = response.get("message")
         if not isinstance(message, dict):
             raise RuntimeError("Local Ollama returned no assistant message.")
+        if message.get("tool_calls") and not tools:
+            raise RuntimeError("Local model requested an unavailable tool.")
         if self.transport and on_token and message.get("content"):
             on_token(message["content"])
         return message
 
     def warm(self, messages=None, tools=None) -> None:
         if not self._warm_lock.acquire(blocking=False):
-            if not self.wait_for_warm(60):raise RuntimeError('Local AI startup is still in progress.')
+            if not self.wait_for_warm(OLLAMA_STARTUP_WAIT_SECONDS):raise RuntimeError('Local AI startup is still in progress.')
             return
         self._warm_complete.clear()
         self.loading.set()
@@ -316,7 +321,7 @@ class OllamaClient:
                 request=urllib.request.Request(OLLAMA_CHAT_URL if messages else OLLAMA_CHAT_URL.rsplit('/',1)[0]+'/generate',
                     data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
                 try:
-                    with opener.open(request,timeout=60) as response:data=json.loads(response.read(65536))
+                    with opener.open(request,timeout=OLLAMA_MODEL_LOAD_TIMEOUT_SECONDS) as response:data=json.loads(response.read(65536))
                     if not data.get('done') or data.get('error'):raise RuntimeError('Local model could not finish loading.')
                     break
                 except (OSError,ValueError,RuntimeError):

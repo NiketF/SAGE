@@ -19,13 +19,13 @@ _ENTRIES = (
     (r"(?:.*\\)?steamapps\\common", "Installed Steam games, one folder per game.",
      "Uninstall games you no longer play from inside Steam; deleting folders here leaves Steam thinking they are installed."),
     (r"(?:.*\\)?steamapps\\shadercache", "Steam's compiled shader cache.",
-     "Safe to clear with Steam closed; games rebuild shaders and may stutter briefly on first launch."),
+     "If this is verified Steam shader cache, clearing it with Steam closed may require shader rebuilding and cause initial stutter."),
     (r"(?:.*\\)?steamapps\\downloading", "Partially downloaded Steam games and updates.",
-     "Safe to clear when Steam is not downloading; Steam downloads them again."),
+     "Review downloads in Steam. Removing these files can discard unfinished downloads and require downloading them again."),
     (r"(?:.*\\)?steamapps\\workshop", "Steam Workshop mods and community content for your games.",
      "Unsubscribe from items in Steam Workshop instead of deleting them here."),
     (r"(?:.*\\)?steamapps", "Steam library data: installed games, downloads, shader cache and workshop content.",
-     "Manage games from inside Steam; shadercache and downloading are the parts that are safe to clear."),
+     "Manage games and downloads from Steam. Review shader cache separately; regeneration and download availability were not checked."),
     (_PF + r"steam", "Steam client by Valve. By default it also holds your installed games under steamapps.",
      "Uninstall Steam via Settings > Apps > Installed apps; that also removes games stored here. To keep Steam, uninstall individual games in Steam."),
     (r"(?:.*\\)?steamlibrary", "A Steam game library folder on this drive.",
@@ -73,12 +73,12 @@ _ENTRIES = (
     (_U + r"appdata\\local\\packages\\canonicalgroup[^\\]*", "A WSL Linux distribution (Ubuntu); its ext4.vhdx is the Linux disk.",
      "Free space inside Linux, or remove the distro with wsl --unregister NAME (this deletes it)."),
     (r"(?:.*\\)?node_modules", "JavaScript dependencies installed for a project.",
-     "If it sits next to package.json, npm install restores it; inside an installed app it is part of the app."),
+     "A nearby package.json suggests project dependencies. Restoration may require package sources, credentials and local changes. Inside an installed app, assess the application instead."),
     (r"(?:.*\\)?\.git", "Git repository history and branches.",
      "Deleting it loses local history and unpushed work; keep it with its project."),
     (r"(?:.*\\)?\.?venv", "A Python virtual environment.",
      "Recreate it from requirements.txt or pyproject.toml if deleted; check the project still needs it."),
-    (r"(?:.*\\)?__pycache__", "Python bytecode cache.", "Safe to delete; Python regenerates it."),
+    (r"(?:.*\\)?__pycache__", "Python bytecode cache.", "This name commonly identifies Python bytecode cache. Confirm source remains available and that it contains no custom data before removal."),
     # Windows
     (r"windows\\winsxs", "Windows component store, used for updates, repair and optional features.",
      "Never delete files here; shrink it with DISM /Online /Cleanup-Image /StartComponentCleanup."),
@@ -112,15 +112,15 @@ _ENTRIES = (
     (r"programdata", "Machine-wide data used by Windows and installed programs.",
      "Do not move this folder. Ask about a named folder inside it."),
     (r"programdata\\nvidia corporation\\downloader", "NVIDIA driver packages downloaded by GeForce Experience/NVIDIA app.",
-     "Safe to delete after the driver is installed."),
-    (r"nvidia|amd", "Extracted graphics driver installer files.", "Safe to delete once the driver is installed."),
+     "Confirm the folder contains only downloaded driver packages and the installation has completed before considering removal."),
+    (r"nvidia|amd", "Extracted graphics driver installer files.", "This name can identify extracted driver packages, but contents and installation state were not verified. Confirm those facts before considering removal."),
     (_PF + r"microsoft office", "Microsoft Office.", "Uninstall or modify Office via Settings > Apps > Installed apps."),
     (r"documents and settings", "A compatibility link to your user profiles, not your Documents folder.",
      "Do not delete or move it. It holds no files. Your documents are under Users."),
     # Personal folders
     (_U + r"onedrive(?: - [^\\]+)?", "Your OneDrive folder, synced with the cloud.",
      "Deleting here also deletes from OneDrive; use 'Free up space' to keep files online-only instead."),
-    (_U + r"downloads", "Your Downloads folder.", "Review old installers, archives and videos; nothing here is needed by Windows."),
+    (_U + r"downloads", "Your Downloads folder.", "Review the actual contents and preserve needed files. This location alone does not establish application dependencies or replacement copies."),
     (_U + r"(?:documents|pictures|videos|music|desktop)", "One of your personal folders.",
      "Personal files: only you can decide what to keep; back up before deleting."),
     (_U + r"appdata\\local\\temp", "Your temporary files.", "Clear via Settings > System > Storage > Temporary files."),
@@ -147,7 +147,9 @@ def describe(path: str) -> dict | None:
         relative = "\\".join(parts[:depth])
         for pattern, what, advice in _COMPILED:
             if pattern.fullmatch(relative):
-                known = {"what": what, "advice": advice}
+                known = {"what": what, "advice": advice,
+                         "basis": "Conventional path/name reference; not a verified assessment",
+                         "limits": "Ownership, current use, dependencies, restoration and deletion eligibility were not checked."}
                 if depth < len(parts):
                     known["inside"] = drive + "\\" + "\\".join(path.split("\\")[1:depth + 1]).lstrip("\\")
                 return known

@@ -99,7 +99,9 @@ class TreePanel(ttk.Frame):
             self._header_motion(event)
 
     def _row_state(self, record):
-        path = self.result.path_for(record.frn) or ""
+        path = self.result.path_for(record.frn)
+        if path is None:
+            return {"text": record.name + "  [Unresolved path]", "tags": ("changed",)}
         removed = self.changes.is_removed(path)
         changed = self.changes.affected(path)
         return {"text": record.name + ("  [Removed]" if removed else "  [Changed]" if changed else ""),

@@ -39,7 +39,8 @@ def scan(names, drive='E:'):
 
 
 def tool(name,args):
-    return {'message':{'content':'','tool_calls':[{'function':{'name':name,'arguments':args}}]}}
+    return {'message':{'content':json.dumps({'intent':'fact' if name=='report_fact' and args.get('final') else 'assessment',
+        'subject':None,'calls':[{'name':name,'args':args}]})}}
 
 
 class IndexTests(unittest.TestCase):
@@ -271,7 +272,7 @@ class ConversationTests(unittest.TestCase):
                 received=[]
                 def transport(payload):
                     received.append(payload)
-                    return {'message':{'content':json.dumps({'purpose':'This folder contains a video.',
+                    return {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose':'This folder contains a video.',
                         'answer':'Review its use before changes. No file was changed.'})}}
                 a=self.make_assistant(transport)
                 reply=a.answer(question,(r'E:\Media',))
@@ -287,7 +288,7 @@ class ConversationTests(unittest.TestCase):
         def transport(payload):
             received.append(payload)
             return tool('search_files',{'query':'config.json'}) if len(received)==1 else {
-                'message':{'content':json.dumps({'purpose':'This JSON file may store settings.',
+                'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose':'This JSON file may store settings.',
                     'answer':'Check its reader before changing it.'})}}
         a=self.make_assistant(transport)
         a.answer('Would changing the project configuration affect anything?')
@@ -298,7 +299,7 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(a.last_timings['model_calls'],2)
 
     def test_paths_from_nested_tree_evidence_can_be_used_in_the_response(self):
-        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None,
             'purpose':'The folder contains footage.',
             'answer':'Review `E:\\Media\\Sub\\Nested\\clip.mp4` before changes.'})}},
             names={'Media/Sub/Nested/clip.mp4':1000})
@@ -329,7 +330,7 @@ class ConversationTests(unittest.TestCase):
         calls=[]
         def transport(payload):
             calls.append(json.dumps(payload))
-            return {'message':{'content':'Keep the files you still need for your work.'}}
+            return {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose': '', 'answer': 'Keep the files you still need for your work.'})}}
         a=self.make_assistant(transport)
         a.answer('I use this for editing. Should I keep it?',(r'E:\Media',))
         a.answer('editing')
@@ -342,7 +343,7 @@ class ConversationTests(unittest.TestCase):
         def transport(payload):
             calls.append(payload)
             return tool('search_files',{'query':'config.json'}) if len(calls)==1 else {
-                'message':{'content':'`E:\\Project\\config.json` may store project settings. Its reader has not been verified. No file was changed.'}}
+                'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose': '', 'answer': '`E:\\Project\\config.json` may store project settings. Its reader has not been verified. No file was changed.'})}}
         a=self.make_assistant(transport)
         reply=a.answer('Where is my project configuration?')
         self.assertIn('config.json',reply)
@@ -354,13 +355,13 @@ class ConversationTests(unittest.TestCase):
         calls=[]
         def transport(payload):
             calls.append(payload)
-            return tool('drive_overview',{}) if len(calls)==1 else {'message':{'content':'This drive contains three files.'}}
+            return tool('drive_overview',{}) if len(calls)==1 else {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose': '', 'answer': 'This drive contains three files.'})}}
         a=self.make_assistant(transport)
         self.assertIn('three files',a.answer('Give me a drive overview.'))
         self.assertEqual(a.last_timings['status'],'model_answer')
 
     def test_explicit_path_overrides_previous_focus_and_selection(self):
-        a=self.make_assistant(lambda _: {'message':{'content':'I will explain the selected item.'}})
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose': '', 'answer': 'I will explain the selected item.'})}})
         a.answer('Explain this.',(r'E:\Media',))
         a.answer(r'Explain E:\Project\config.json',(r'E:\Media',))
         self.assertEqual(a.focus,[r'E:\Project\config.json'])
@@ -369,22 +370,22 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(a.tools.focus,[])
 
     def test_missing_path_with_spaces_is_not_shortened_to_existing_parent(self):
-        a=self.make_assistant(lambda _: {'message':{'content':'{"fact":"size"}'}})
+        a=self.make_assistant(lambda _: {'message':{'content':'{"intent": "fact", "subject": null, "fact": "size"}'}})
         a.answer(r'Explain E:\Project New folder?')
         self.assertEqual(a.unresolved_paths,[r'E:\Project New folder'])
         self.assertEqual(a.tools.focus,[])
 
     def test_unchanged_tree_selection_does_not_override_conversation_focus(self):
-        a=self.make_assistant(lambda _: {'message':{'content':'I can explain that item.'}})
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose': '', 'answer': 'I can explain that item.'})}})
         a.answer('Explain this.',(r'E:\Media',))
         a.answer(r'Explain E:\Project\config.json',(r'E:\Media',))
-        a.client.transport=lambda _: {'message':{'content':'{"fact":"size"}'}}
+        a.client.transport=lambda _: {'message':{'content':'{"intent": "fact", "subject": null, "fact": "size"}'}}
         reply=a.answer('How big is it?',(r'E:\Media',))
         self.assertIn(r'E:\Project\config.json',reply)
         self.assertIn('100 B',reply)
 
     def test_multiple_path_references_keep_an_unscanned_destination_separate(self):
-        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None,
             'purpose':'This video file contains footage.',
             'answer':'Moving it may affect links. The requested `D:\\Archive` is not in this scan. No file was changed.'})}})
         reply=a.answer(r'What happens if I move E:\Media\clip.mp4 to D:\Archive?')
@@ -394,7 +395,7 @@ class ConversationTests(unittest.TestCase):
         with self.assertRaises(ValueError):a.tools.call('inspect_path',{'path':r'D:\Archive'})
 
     def test_unknown_paths_are_not_displayed_even_without_backticks(self):
-        a=self.make_assistant(lambda _: {'message':{'content':'Delete E:\\Invented\\data.txt to save space.'}})
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose': '', 'answer': 'Delete E:\\Invented\\data.txt to save space.'})}})
         reply=a.answer('What can I remove?',(r'E:\Media',))
         self.assertNotIn('Invented',reply)
         self.assertEqual(a.last_timings['status'],'fallback')
@@ -423,7 +424,7 @@ class ConversationTests(unittest.TestCase):
         self.assertGreaterEqual(sum(len(sentence.split())<=20 for sentence in sentences)/len(sentences),.8)
 
     def test_cold_model_loads_in_background_without_queuing_question(self):
-        a=self.make_assistant(lambda _: {'message':{'content':'unused'}})
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose': '', 'answer': 'unused'})}})
         a.client.transport=None;a.client.loading.set()
         with patch.object(a.client,'wait_for_warm',return_value=False),patch.object(a.client,'chat',side_effect=AssertionError('Startup did not finish')):
             started=time.monotonic()
@@ -438,27 +439,27 @@ class ConversationTests(unittest.TestCase):
         def transport(payload):
             calls.append(payload)
             return tool('report_fact',{'field':'size','final':False}) if len(calls)==1 else {
-                'message':{'content':'Review the video before removal. Keep it if you still need it. No file was changed.'}}
+                'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose': '', 'answer': 'Review the video before removal. Keep it if you still need it. No file was changed.'})}}
         a=self.make_assistant(transport)
         reply=a.answer('Should I remove this to save space?',(r'E:\Media',))
         self.assertIn('Review the video',reply)
         self.assertEqual(a.last_timings['model_calls'],2)
 
     def test_compact_json_fact_and_lookup_protocol(self):
-        a=self.make_assistant(lambda _: {'message':{'content':'{"fact":"size"}'}})
+        a=self.make_assistant(lambda _: {'message':{'content':'{"intent": "fact", "subject": null, "fact": "size"}'}})
         self.assertIn('1000 B',a.answer('What is its storage footprint?',(r'E:\Media',)))
         self.assertEqual(a.last_timings['model_calls'],1)
         calls=[]
         def transport(payload):
             calls.append(payload)
-            data={'calls':[{'name':'search_files','args':{'query':'config.json'}}]} if len(calls)==1 else {'answer':'`E:\\Project\\config.json` is a configuration candidate.'}
+            data={'intent': 'assessment', 'subject': None, 'calls':[{'name':'search_files','args':{'query':'config.json'}}]} if len(calls)==1 else {'intent':'assessment','subject':None,'purpose':'','answer':'`E:\\Project\\config.json` is a configuration candidate.'}
             return {'message':{'content':json.dumps(data)}}
         a=self.make_assistant(transport)
         self.assertIn('configuration candidate',a.answer('Where are my settings?'))
         self.assertEqual(a.last_timings['tool_calls'],1)
 
     def test_model_written_explanation_is_placed_before_assessment(self):
-        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None,
             'answer':'Removing it may reset settings. Check references first.',
             'purpose':'This JSON file likely stores project settings.'})}})
         reply=a.answer('Can I delete it?',(r'E:\Project\config.json',))
@@ -466,7 +467,7 @@ class ConversationTests(unittest.TestCase):
         self.assertLess(reply.index('stores project settings'),reply.index('Removing it'))
 
     def test_stream_does_not_show_assessment_before_description(self):
-        a=self.make_assistant(lambda _: {'message':{'content':'unused'}})
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose': '', 'answer': 'unused'})}})
         a.client.transport=None
         tokens=[]
         def chat(messages,on_token,**kwargs):
@@ -498,7 +499,7 @@ class ConversationTests(unittest.TestCase):
         self.assertFalse(paths_verified(r'E:\Project\config.json.bak is data.',known))
 
     def test_data_size_and_disk_allocation_are_not_confused(self):
-        a=self.make_assistant(lambda _: {'message':{'content':'{"fact":"logical_size"}'}})
+        a=self.make_assistant(lambda _: {'message':{'content':'{"intent": "fact", "subject": null, "fact": "logical_size"}'}})
         entry=a.evidence.inspect(r'E:\Media\clip.mp4')
         a.result.records[entry['frn']].allocated_size=4096
         reply=a.answer('How much room does this take?',(entry['path'],))
@@ -506,26 +507,27 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('4.0 KB of disk space',reply)
 
     def test_model_cannot_claim_that_it_changed_files(self):
-        a=self.make_assistant(lambda _: {'message':{'content':'I deleted the files for you.'}})
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose': '', 'answer': 'I deleted the files for you.'})}})
         self.assertNotIn('I deleted',a.answer('Please remove this.',(r'E:\Media',)))
         self.assertEqual(a.last_suggestions,[])
 
     def test_streamed_paragraphs_and_final_tail_are_delivered_once(self):
         text='The file is project data.\n\nIts reader has not been verified.'
-        a=self.make_assistant(lambda _: {'message':{'content':text}})
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({'intent':'assessment','subject':None,'purpose':'','answer':text})}})
         tokens=[]
         reply=a.answer('Explain this.',(r'E:\Project\config.json',),on_token=tokens.append)
         self.assertEqual(''.join(tokens),reply)
+        self.assertEqual(reply,text)
 
     def test_partial_generation_auto_continues_and_has_action_confirmation(self):
-        a=self.make_assistant(lambda _: {'message':{'content':'This file may store project settings. Removing it could'},'done_reason':'length'})
+        a=self.make_assistant(lambda _: {'message':{'content':'{"intent":"assessment","subject":null,"purpose":"This file may store project settings.","answer":"Removing it could'},'done_reason':'length'})
         reply=a.answer('What happens if I remove it?',(r'E:\Project\config.json',))
         self.assertNotIn('partial explanation',reply)
         self.assertNotIn('Removing it could',reply)
         self.assertNotIn('No file was changed',reply)
 
     def test_c_drive_policy_is_separate_without_write_tools(self):
-        a=self.make_assistant(lambda _: {'message':{'content':'This is an explanation.'}})
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose': '', 'answer': 'This is an explanation.'})}})
         self.assertEqual(a.action_policy['tier'],'default_read_only')
         c=DriveAssistant(scan({'Windows/data.txt':10},drive='C:'),index=a.index)
         self.assertEqual(c.action_policy['tier'],'c_strict_read_only')
@@ -533,7 +535,7 @@ class ConversationTests(unittest.TestCase):
         self.assertFalse(any('delete' in definition['function']['name'] for definition in c.tools.definitions()))
 
     def test_initialization_does_not_index_and_worker_can_cancel(self):
-        a=self.make_assistant(lambda _: {'message':{'content':'Hello'}})
+        a=self.make_assistant(lambda _: {'message':{'content':json.dumps({'intent': 'assessment', 'subject': None, 'purpose': '', 'answer': 'Hello'})}})
         started=threading.Event();release=threading.Event();threads=[]
         def indexing(*args,**kwargs):
             threads.append(threading.current_thread().name);started.set();release.wait(1)
