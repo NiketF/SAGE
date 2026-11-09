@@ -60,7 +60,7 @@ def main():
                     for question,selected in CASES[name]:
                         if name=='paraphrases':
                             assistant.history=[];assistant.focus=[];assistant.listed=[]
-                        reply=assistant.answer(question,selected,on_token=lambda _:None)
+                        reply=assistant.ask(question,selected,on_token=lambda _:None)
                         sentences=re.split(r'(?<=[.!?])\s+',re.sub(r'`[^`]*`','PATH',reply))
                         short=sum(len(sentence.split())<=20 for sentence in sentences)
                         record={'case':name,'question':question,'selected':selected,'reply':reply,

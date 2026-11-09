@@ -672,21 +672,43 @@ class ScanEvidence:
         scope = ntpath.normcase(ntpath.normpath(scope)).rstrip("\\")
         return path == scope or path.startswith(scope + "\\")
 
-    def resolve_name(self, name: str, scope: str | None = None, limit: int = 7) -> list[dict]:
+    @classmethod
+    def literal_subject(cls, question: str) -> str | None:
+        """Extract one literal name from simple prompts; leave complex wording to the model."""
+        # ponytail: use the existing question vocabulary at the edges only.
+        # A scope clause or multiple names normally leaves a phrase with no exact match.
+        question = question.strip()[:2000]
+        words = list(_WORD.finditer(question))
+        start = 0
+        while start < len(words):
+            word = words[start].group().casefold()
+            if word not in cls._IGNORED and word not in {"relocate", "relocating", "moving", "removing", "deleting"}:
+                break
+            start += 1
+        if start == len(words):
+            return None
+        name = question[words[start].start():].rstrip(' ?.!"\'`')
+        return name if not name.isdigit() else None
+
+    def resolve_name(self, name: str, scope: str | None = None, limit: int | None = 7, *, folders_only: bool = False) -> list[dict]:
         """Exact names only; a partial match is a clarification option, not a target."""
-        key = (name.casefold(), ntpath.normcase(scope or ""), limit)
+        key = (name.casefold(), ntpath.normcase(scope or ""), limit, folders_only)
         if key not in self._name_cache:
             matches = []
             for record in self.result.records.values():
                 if record.name.casefold() != key[0] or record.frn == self.result.root_frn:
                     continue
+                if folders_only and not record.is_directory:
+                    continue
                 path = self.result.path_for(record.frn)
                 if path and (scope is None or self.within(path, scope)):
                     matches.append(record.frn)
-                    if len(matches) >= limit:
+                    if limit is not None and len(matches) >= limit:
                         break
             # ponytail: exact-name lookup is one metadata pass on a cache miss.
             # Cache 32 queries rather than building a second index for every file.
+            if limit is None and len(matches) > 8:
+                return [self._entry(self.result.records[frn]) for frn in matches]
             if len(self._name_cache) >= 32:
                 self._name_cache.clear()
             self._name_cache[key] = tuple(matches)

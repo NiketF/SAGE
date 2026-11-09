@@ -108,7 +108,7 @@ class ConversationalIntentTests(unittest.TestCase):
         self.assertIn('No verified match',reply)
         self.assertNotIn('Kingdom Come',reply)
         self.assertEqual(self.assistant.last_suggestions,[])
-        self.assertTrue(any(row['name']=='search_files' and not row['result'].get('items') for row in self.assistant.last_context['lookups']))
+        self.assertTrue(any(row['name']=='subject_resolution' and not row['result'].get('items') for row in self.assistant.last_context['lookups']))
 
     def test_existing_named_file_in_selected_folder_is_inspected(self):
         self.model_reply={'intent': 'assessment', 'subject':'photo.jpg','purpose':'This is an image file.','answer':'Review whether you need it.'}

@@ -83,13 +83,50 @@ class ResponseRuntimeTests(unittest.TestCase):
                 return io.BytesIO(json.dumps({'model_info':{'general.architecture':'example','example.block_count':4}}).encode())
             if payload['options']['num_gpu']==6:raise OSError('Preferred placement unavailable')
             return io.BytesIO(b'{"done":true}')
-        with patch.object(OllamaClient,'_gpu_layers',{}),patch.object(OllamaClient,'_ensure_server'),\
+        with patch.object(OllamaClient,'_gpu_layers',{}),patch.object(OllamaClient,'_ensure_server'),patch.object(OllamaClient,'ready',return_value=False),\
              patch('sage.services.local_ai.urllib.request.build_opener') as opener:
             opener.return_value.open.side_effect=open_request
-            client=OllamaClient();client.warm([{'role':'system','content':'Test instructions'}])
+            client=OllamaClient();client.warm()
+            self.assertTrue(all('messages' not in row for row in payloads))
             self.assertEqual([row['options']['num_gpu'] for row in payloads if 'options' in row],[6,-1])
             self.assertEqual(client._runtime_options(),{'num_ctx':8192,'num_batch':128,'num_gpu':-1})
             self.assertFalse(client.loading.is_set());self.assertTrue(client.wait_for_warm(0))
+
+    def test_preload_reuses_resident_gpu_placement(self):
+        with patch.object(OllamaClient,'_gpu_layers',{}),patch.object(OllamaClient,'_ensure_server'),\
+             patch.object(OllamaClient,'ready',return_value=True),\
+             patch('sage.services.local_ai.urllib.request.build_opener') as opener:
+            send=opener.return_value.open
+            send.return_value=io.BytesIO(b'{"done":true,"load_duration":25000000}')
+            client=OllamaClient()
+            timings={}
+            client.warm(timings=timings)
+            send.assert_called_once()
+            self.assertTrue(timings['already_resident'])
+            self.assertEqual(timings['preload_attempts'][0]['ollama_load_seconds'],.025)
+            request=send.call_args.args[0]
+            self.assertTrue(request.full_url.endswith('/generate'))
+            self.assertEqual(json.loads(request.data)['options'],{**client._runtime_options(),'num_predict':1})
+            self.assertEqual(client._runtime_options()['num_gpu'],-1)
+
+    def test_final_investigation_turn_accepts_only_an_answer(self):
+        formats=[]
+        target=r'C:\ProgramData\App'
+        def respond(payload):
+            formats.append(payload['format'])
+            reply={'intent':'assessment','subject':target,'scope':None}
+            if len(formats)<3:
+                reply['calls']=[{'name':'list_children','args':{'path':target}}]
+            else:
+                self.assertEqual(payload['format']['required'],['intent','subject','scope','purpose','answer'])
+                self.assertNotIn('calls',payload['format']['properties'])
+                reply.update(purpose='This folder holds application data.',
+                             answer='Review the settings and cache separately before cleanup.')
+            return {'message':{'content':json.dumps(reply)}}
+        a=self.assistant(respond)
+        self.assertIn('settings and cache separately',a.ask(r'What is in C:\ProgramData\App?'))
+        self.assertEqual(a.last_timings['tool_calls'],2)
+        self.assertEqual(a.last_timings['status'],'model_answer')
 
     def test_cancelled_question_does_not_wait_for_model_startup(self):
         client=OllamaClient();client.cancel()
@@ -125,7 +162,7 @@ class ResponseRuntimeTests(unittest.TestCase):
             on_token(raw)
             return {'content':raw}
         with patch.object(a.client,'chat',side_effect=chat):
-            reply=a.answer('Can I remove ProgramData?',on_token=visible.append,on_reset=reset)
+            reply=a.answer(r'Can I remove C:\ProgramData?',on_token=visible.append,on_reset=reset)
         self.assertEqual(len(calls),2);self.assertEqual(resets,[1])
         self.assertEqual(''.join(visible),reply)
         self.assertNotIn('Old recommendation',reply)
@@ -201,7 +238,7 @@ class ResponseRuntimeTests(unittest.TestCase):
             self.assertEqual(a.answer('hello'),'Hello!')
         self.assertEqual(a.last_timings['total_seconds'],31)
 
-    def test_loaded_short_subject_does_not_trigger_another_lookup_or_generation(self):
+    def test_loaded_short_subject_checks_for_duplicates_without_another_generation(self):
         result=scan({'Program Files/Editor/app.exe':100},drive='C:')
         a=DriveAssistant(result,OllamaClient(),self.index);visible=[]
         raw=json.dumps({'intent':'assessment','subject':'program files',
@@ -211,8 +248,9 @@ class ResponseRuntimeTests(unittest.TestCase):
             on_token(raw)
             return {'content':raw}
         with patch.object(a.client,'chat',side_effect=chat) as model, \
-             patch.object(a.tools,'resolve_subject',side_effect=AssertionError('The matching tree is already inspected')):
+             patch.object(a.tools,'resolve_subject',wraps=a.tools.resolve_subject) as resolve:
             reply=a.answer('what is program files',on_token=visible.append)
+        resolve.assert_called_once_with('program files',limit=None)
         self.assertIn('stores installed applications',reply)
         self.assertEqual(''.join(visible),reply)
         self.assertEqual(model.call_count,1)

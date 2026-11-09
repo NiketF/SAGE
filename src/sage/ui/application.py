@@ -25,7 +25,7 @@ from ..services.evidence import EvidenceAssistant, format_bytes
 from ..services.local_ai import OllamaClient
 from ..services.conversation import DriveAssistant as ConversationAssistant
 from ..services.scanner import analyze_sizes, scan_ntfs
-from ..services.scan_timing import write_scan_timings
+from ..services.scan_timing import write_ai_timings, write_scan_timings
 from .assistant_panel import AssistantPanel
 from .styles import ACCENT, SURFACE, TEXT, TEXT_SECONDARY, configure_styles
 from .tree_panel import TreePanel
@@ -87,6 +87,7 @@ class SageApplication(tk.Tk):
         self._drive_refresh_closed = False
 
         self._ai_status_job = None
+        self._ai_timings = None
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(50, self._drain_events)
@@ -98,14 +99,37 @@ class SageApplication(tk.Tk):
     def _warm_ai(self) -> None:
         self.assistant_panel.set_status("Loading local AI…")
 
+        started = time.monotonic()
+        timings = None
+        if os.environ.get("SAGE_AI_TIMINGS") == "1":
+            timings = {"status": "loading", "started_unix_seconds": time.time()}
+            self._ai_timings = {"startup": dict(timings), "replies": []}
+            write_ai_timings(self._ai_timings)
+
         def worker() -> None:
             client = OllamaClient()
             try:
-                client.warm([{'role':'system','content':self._conversation.system_prompt()}])
+                if timings is None:
+                    client.warm()
+                else:
+                    client.warm(timings=timings)
+                    timings["status"] = "complete"
                 status = "Ready for your question."
             except RuntimeError as exc:
+                if timings is not None:
+                    timings.update(status="failed", error_type=type(exc).__name__)
                 status = f"Local AI unavailable: {exc}"
-            self._events.put(("ai_status", client.ready(), status))
+            if timings is None:
+                self._events.put(("ai_status", client.ready(), status))
+                return
+            running = client.running_model()
+            timings.update(model=client.model, online=running is not None,
+                           warmup_seconds=round(time.monotonic()-started, 3))
+            if running is not None:
+                for key in ("size", "size_vram", "context_length"):
+                    if type(running.get(key)) is int:
+                        timings[key] = running[key]
+            self._events.put(("ai_status", running is not None, status, timings, started))
 
         threading.Thread(target=worker, daemon=True, name="sage-ai-warmup").start()
 
@@ -324,8 +348,12 @@ class SageApplication(tk.Tk):
             while True:
                 event = self._events.get_nowait()
                 if event[0] == "ai_status":
-                    _, ready, startup_status = event
+                    _, ready, startup_status = event[:3]
                     self.assistant_panel.model_status.set("Local AI: Online" if ready else "Local AI: Offline")
+                    if len(event) > 3:
+                        self._ai_timings["startup"] = event[3]
+                        event[3]["status_handoff_seconds"] = round(time.monotonic()-event[4], 3)
+                        write_ai_timings(self._ai_timings)
                     if startup_status and not self._assistant_busy:
                         self.assistant_panel.set_status(startup_status)
                     self._ai_status_job = self.after(5000, self._refresh_ai_status)
@@ -407,6 +435,15 @@ class SageApplication(tk.Tk):
                 elif kind == "assistant_answer":
                     self._assistant_busy = False
                     self.assistant_panel.finish_reply(event[3])
+                    if len(event) > 7 and event[7] is not None:
+                        report, started = event[7]
+                        elapsed = round(time.monotonic()-started, 3)
+                        report.setdefault("first_ui_text_seconds", elapsed)
+                        report["ui_complete_seconds"] = elapsed
+                        replies = self._ai_timings["replies"]
+                        replies.append(report)
+                        del replies[:-8]
+                        write_ai_timings(self._ai_timings)
                     if len(event) > 4 and event[4]:
                         suggestions = [s for s in event[4] if not self.tree_panel.changes.affected(s.path)]
                         self.assistant_panel.add_cleanup_actions(suggestions, self._delete_suggestion)
@@ -419,6 +456,8 @@ class SageApplication(tk.Tk):
                             self.assistant_panel.set_selected_item(new_target)
                 elif kind == "assistant_token":
                     self.assistant_panel.append_reply(event[3])
+                    if len(event) > 4 and event[4] is not None and event[3].strip():
+                        event[4].setdefault("first_ui_text_seconds", round(time.monotonic()-event[5], 3))
                 elif kind == "assistant_reset":
                     self.assistant_panel.reset_reply()
                 elif kind == "assistant_status":
@@ -571,15 +610,23 @@ class SageApplication(tk.Tk):
         active_item = self.assistant_panel.get_selected_item()
         selected_paths = (active_item,) if active_item else ()
         self.assistant_panel.begin_reply()
+        started = time.monotonic()
+        report = None
+        if self._ai_timings is not None:
+            report = {"request_id": request_id, "submitted_unix_seconds": time.time(),
+                      "has_scan": conversation.result is not None}
+
+        def emit_token(token):
+            self._events.put(("assistant_token", generation, request_id, token, report, started))
 
         def worker() -> None:
             suggestions: list[CleanupSuggestion] = []
             links: list[dict] = []
             new_focus: str | None = None
             try:
-                answer = conversation.answer(
+                answer = conversation.ask(
                     question, selected_paths, quoted=quoted,
-                    on_token=lambda token: self._events.put(("assistant_token", generation, request_id, token)),
+                    on_token=emit_token,
                     on_status=lambda status: self._events.put(("assistant_status", generation, request_id, status)),
                     on_reset=lambda: self._events.put(("assistant_reset", generation, request_id)),
                 )
@@ -589,7 +636,23 @@ class SageApplication(tk.Tk):
                     new_focus = conversation.focus[0]
             except Exception as exc:
                 answer = f"Could not answer from the current scan: {exc}"
-            self._events.put(("assistant_answer", generation, request_id, answer, suggestions, links, new_focus))
+                if report is not None:
+                    report.update(status="exception", error_type=type(exc).__name__)
+            if report is not None and "status" not in report:
+                metrics = conversation.last_timings
+                report["status"] = metrics.get("status", "unknown")
+                for key in ("model_calls", "tool_calls", "total_seconds", "startup_wait_seconds",
+                            "interpretation_seconds", "evidence_setup_seconds", "lookup_seconds",
+                            "subject_lookup_seconds", "first_token_seconds", "first_display_seconds"):
+                    if type(metrics.get(key)) in (int, float):
+                        report[key] = round(metrics[key], 3)
+                report["model_calls_detail"] = [
+                    {key.replace("_duration", "_seconds"): round(call[key]/1e9, 3) for key in
+                     ("load_duration", "prompt_eval_duration", "eval_duration") if type(call.get(key)) is int}
+                    for call in metrics.get("model_metrics", [])
+                ]
+            timing_event = (report, started) if report is not None else None
+            self._events.put(("assistant_answer", generation, request_id, answer, suggestions, links, new_focus, timing_event))
 
         threading.Thread(target=worker, daemon=True, name="sage-local-ai").start()
         return None

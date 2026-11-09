@@ -42,7 +42,7 @@ def main() -> None:
     print("SAGE local AI smoke evaluation — synthetic data; no real files are changed.\n")
     for question, selected_paths in cases:
         started = time.monotonic()
-        answer = assistant.answer(question, selected_paths)
+        answer = assistant.ask(question, selected_paths)
         print(f"Q: {question}\nA: {answer}\nTime: {time.monotonic() - started:.1f}s\nTiming details: {assistant.last_timings}\n")
     print("Review each answer for correct paths and sizes. Protected folders must never be recommended for direct deletion.")
 

@@ -1,4 +1,4 @@
-"""Opt-in local scan timings. Diagnostic I/O must never affect scan success."""
+"""Opt-in local timing reports. Diagnostic I/O must never affect app success."""
 import json
 import os
 from pathlib import Path
@@ -21,15 +21,24 @@ def begin_scan_timings(progress, drive):
 def write_scan_timings(report):
     if report is None or os.environ.get('SAGE_SCAN_TIMINGS') != '1':
         return
+    _write_report(report, 'scan-timing-last.json')
+
+
+def write_ai_timings(report):
+    if report is not None and os.environ.get('SAGE_AI_TIMINGS') == '1':
+        _write_report(report, 'ai-timing-last.json')
+
+
+def _write_report(report, filename):
     temporary = None
     try:
         folder = Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'SAGE'
         folder.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=folder,
-                prefix='scan-timing-', suffix='.tmp', delete=False) as stream:
+                prefix=filename+'-', suffix='.tmp', delete=False) as stream:
             temporary = Path(stream.name)
             json.dump(report, stream, indent=2)
-        temporary.replace(folder / 'scan-timing-last.json')
+        temporary.replace(folder / filename)
     except (OSError, ValueError, TypeError):
         pass
     finally:

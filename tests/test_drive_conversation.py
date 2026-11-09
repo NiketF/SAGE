@@ -43,6 +43,49 @@ def tool(name,args):
         'subject':None,'calls':[{'name':name,'args':args}]})}}
 
 
+class ConversationScopeTests(unittest.TestCase):
+    def test_prompt_only_scope_survives_subject_followup_and_can_switch_to_drive(self):
+        result=scan({'Program Files (x86)/Steam/game.bin':20, 'Outside/big.bin':90,
+                     'A/Cache/a.bin':10, 'B/Cache/b.bin':8}, drive='C:')
+        folder=r'C:\Program Files (x86)'
+        steam=folder+r'\Steam'
+
+        def reply(intent='assessment', subject=None, **fields):
+            return {'message':{'content':json.dumps({'intent':intent,'subject':subject,**fields})}}
+
+        def ranking(**fields):
+            return reply(intent='fact', **fields, calls=[
+                {'name':'search_files','args':{'kind':'file','sort':'largest','limit':1}}])
+
+        responses=iter([
+            reply(scope='Program Files x86',calls=[{'name':'cleanup_candidates','args':{}}]),
+            reply(purpose='',answer='Review the installed applications.'),
+            reply(subject='Steam',scope=steam,calls=[{'name':'inspect_path','args':{'path':steam}}]),
+            reply(subject=steam,purpose='Steam manages games.',answer='Review it before uninstalling.'),
+            ranking(scope='Cache'),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            assistant=DriveAssistant(result, OllamaClient(transport=lambda _: next(responses)),
+                                     DriveIndex(str(Path(tmp)/'index.sqlite3')))
+            assistant.answer('What can I remove from Program Files x86?')
+            self.assertEqual(assistant.scope,folder)
+            self.assertEqual(assistant.last_context['lookups'][0]['arguments']['scope'],folder)
+            self.assertIn(r'C:\Program Files (x86)\Steam\game.bin', assistant.answer('What is taking up space?'))
+            assistant.answer('What about Steam?')
+            self.assertEqual(assistant.focus,[steam])
+            self.assertEqual(assistant.scope,folder)
+            assistant.answer('What is taking up space?')
+            self.assertEqual(assistant.last_context['lookups'][0]['arguments']['scope'],folder)
+            assistant.answer('Now show the largest file on the whole C: drive.')
+            self.assertEqual(assistant.scope,'C:\\')
+            self.assertEqual(assistant.last_context['lookups'][0]['result']['items'][0]['path'],r'C:\Outside\big.bin')
+            answer=assistant.answer('What is taking up space in Cache?')
+            self.assertIn(r'C:\A\Cache',answer)
+            self.assertIn(r'C:\B\Cache',answer)
+            self.assertEqual(assistant.scope,'C:\\')
+            self.assertEqual(assistant.last_timings['tool_calls'],0)
+
+
 class IndexTests(unittest.TestCase):
     def test_removed_paths_and_changed_content_are_not_retained(self):
         with tempfile.TemporaryDirectory() as tmp:

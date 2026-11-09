@@ -15,6 +15,8 @@ import urllib.error
 import urllib.request
 import urllib.parse
 from collections.abc import Callable
+from contextlib import ExitStack
+from pathlib import Path
 
 from ..models import ScanResult
 from .action_policy import policy_for
@@ -156,16 +158,18 @@ class OllamaClient:
         if self._cancelled.is_set(): self.cancel()
 
     def ready(self):
-        if self.transport is not None:return True
+        return self.transport is not None or self.running_model() is not None
+
+    def running_model(self):
         try:
             opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
             with opener.open(OLLAMA_CHAT_URL.rsplit('/',1)[0]+'/ps',timeout=.25) as response:
                 data=json.loads(response.read(65536))
-            return any(model.get('name')==self.model for model in data.get('models',[]))
-        except (OSError,ValueError,TypeError,AttributeError):return False
+            return next((model for model in data.get('models',[]) if model.get('name')==self.model),None)
+        except (OSError,ValueError,TypeError,AttributeError):return None
 
     @classmethod
-    def _ensure_server(cls):
+    def _ensure_server(cls, timings=None):
         """Start the installed local runtime once; never install or download it."""
         endpoint=urllib.parse.urlsplit(OLLAMA_CHAT_URL)
         if endpoint.hostname not in {'localhost','127.0.0.1','::1'}:return
@@ -174,16 +178,34 @@ class OllamaClient:
                 with socket.create_connection((endpoint.hostname,endpoint.port or 11434),timeout=.25):return True
             except OSError:return False
         with cls._start_lock:
-            if listening():return
+            if listening():
+                if timings is not None:
+                    timings['server_source']='already_running'
+                return
             if cls._server_process is None or cls._server_process.poll() is not None:
                 executable=shutil.which('ollama')
                 if not executable:
                     candidate=ntpath.join(os.environ.get('LOCALAPPDATA',''),'Programs','Ollama','ollama.exe')
                     if os.path.isfile(candidate):executable=candidate
                 if not executable:raise RuntimeError('Ollama was not found. Install it or make its executable available to SAGE.')
-                cls._server_process=subprocess.Popen([executable,'serve'],stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
-                    creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+                with ExitStack() as resources:
+                    output=subprocess.DEVNULL
+                    if timings is not None and os.environ.get('SAGE_AI_TIMINGS')=='1':
+                        # ponytail: one local log per diagnostic server launch.
+                        # The child owns its output handle until it exits.
+                        folder=Path(os.environ.get('LOCALAPPDATA') or Path.home())/'SAGE'
+                        log=folder/f'ollama-startup-{time.time_ns()}-{os.getpid()}.log'
+                        try:
+                            folder.mkdir(parents=True,exist_ok=True)
+                            output=resources.enter_context(log.open('xb'))
+                            timings['ollama_log_file']=log.name
+                        except OSError as exc:
+                            timings['ollama_log_error_type']=type(exc).__name__
+                    if timings is not None:
+                        timings['server_source']='started_by_sage'
+                    cls._server_process=subprocess.Popen([executable,'serve'],stdin=subprocess.DEVNULL,
+                        stdout=output,stderr=subprocess.STDOUT if output!=subprocess.DEVNULL else subprocess.DEVNULL,
+                        creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
             # Startup runs in the existing background worker, outside question time.
             deadline=time.monotonic()+5
             while time.monotonic()<deadline:
@@ -292,7 +314,9 @@ class OllamaClient:
             on_token(message["content"])
         return message
 
-    def warm(self, messages=None, tools=None) -> None:
+    def warm(self, messages=None, tools=None, *, timings=None) -> None:
+        if timings is None:
+            timings={}
         if not self._warm_lock.acquire(blocking=False):
             if not self.wait_for_warm(OLLAMA_STARTUP_WAIT_SECONDS):raise RuntimeError('Local AI startup is still in progress.')
             return
@@ -302,9 +326,18 @@ class OllamaClient:
         if messages:
             payload.update(messages=messages,tools=tools or [],think=False)
         try:
-            self._ensure_server()
+            server_started=time.monotonic()
+            try:
+                self._ensure_server(timings)
+            finally:
+                timings['server_wait_seconds']=round(time.monotonic()-server_started,3)
             opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            if self.model not in self._gpu_layers:
+            resident=self.ready()
+            timings['already_resident']=resident
+            if resident:
+                # Let Ollama reuse compatible resident GPU placement.
+                self._gpu_layers[self.model]=-1
+            elif self.model not in self._gpu_layers:
                 try:
                     request=urllib.request.Request(OLLAMA_CHAT_URL.rsplit('/',1)[0]+'/show',
                         data=json.dumps({'model':self.model}).encode(),headers={'Content-Type':'application/json'})
@@ -320,12 +353,21 @@ class OllamaClient:
                 payload['options']={**self._runtime_options(),'num_predict':1}
                 request=urllib.request.Request(OLLAMA_CHAT_URL if messages else OLLAMA_CHAT_URL.rsplit('/',1)[0]+'/generate',
                     data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
+                attempt_started=time.monotonic()
+                attempt={'gpu_layers_requested':layers,'status':'failed'}
                 try:
                     with opener.open(request,timeout=OLLAMA_MODEL_LOAD_TIMEOUT_SECONDS) as response:data=json.loads(response.read(65536))
                     if not data.get('done') or data.get('error'):raise RuntimeError('Local model could not finish loading.')
+                    attempt['status']='complete'
+                    if type(data.get('load_duration')) is int:
+                        attempt['ollama_load_seconds']=round(data['load_duration']/1e9,3)
                     break
-                except (OSError,ValueError,RuntimeError):
+                except (OSError,ValueError,RuntimeError) as exc:
+                    attempt['error_type']=type(exc).__name__
                     if layers==-1:raise
+                finally:
+                    attempt['request_seconds']=round(time.monotonic()-attempt_started,3)
+                    timings.setdefault('preload_attempts',[]).append(attempt)
         except (OSError, ValueError) as exc:
             raise RuntimeError("Local model is not ready. Scan facts remain available.") from exc
         finally:

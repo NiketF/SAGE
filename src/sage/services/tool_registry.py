@@ -72,6 +72,10 @@ class ToolRegistry:
             items = self._scoped_cleanup_cache[key]
         return [s for s in items if not self.scan_changes or not self.scan_changes.affected(s.path)][:limit]
 
+    def accepts_scope(self, name: str) -> bool:
+        spec = self._SPECS.get(name)
+        return spec is not None and 'scope' in spec.optional
+
     def validate(self, name: str, arguments: dict) -> None:
         if not isinstance(arguments,dict):
             raise ValueError('Tool arguments must be an object.')
@@ -414,29 +418,19 @@ class ToolRegistry:
 
         raise ValueError(f"Unsupported tool: {name}")
 
-    def resolve_subject(self,query,limit=8):
-        """Resolve AI-interpreted names without changing general search semantics."""
-        if not self.evidence:return {'items':[],'coverage':'No scan loaded.'}
+    def resolve_subject(self, query, limit=8, *, scope=None):
+        """Resolve a name across the retained scan or within an explicit folder."""
+        if not self.evidence:
+            return {'items': [], 'partial': False}
         if ntpath.isabs(query):
-            item=self.evidence.inspect(query)
-            return {'items':[] if 'error' in item else [item],'partial':False}
-        # Multiple conversational targets do not establish one preferred parent.
-        scopes=(list(self.subject_scope) if len(self.subject_scope)==1 else [])+[None]
-        for scope in scopes:
-            if scope:
-                current=self.evidence.inspect(scope)
-                if 'error' in current:continue
-                if current['kind']=='file':scope=ntpath.dirname(scope)
-            matches=self.evidence.resolve_name(query,scope,limit=limit+1)
-            match_type='exact name'
-            if not matches:
-                matches=self.evidence.loose_folders(query,scope,limit=limit+1)
-                match_type='normalized folder name'
-            if matches:
-                return {'items':matches[:limit],'partial':len(matches)>limit,'match_type':match_type,
-                        'resolution':'conversation scope' if scope else 'retained hierarchy',
-                        'instruction':'Inspect the unique target. If alternatives remain, clarify before a change assessment.'}
-        return {'items':[],'coverage':'No exact or normalized folder-name match in retained scan records. Skipped or unscanned records remain unknown.'}
+            item = self.call('inspect_path', {'path': query})
+            return {'items': [] if 'error' in item else [item], 'partial': False}
+        matches = self.evidence.resolve_name(query, scope, limit=None if limit is None else limit+1)
+        partial = limit is not None and len(matches) > limit
+        changes = self.scan_changes
+        if changes and changes.stale:
+            matches = [item for item in matches if not changes.is_removed(item['path'])]
+        return {'items': matches[:limit], 'partial': partial}
 
     def _optional_applications(self,scope,limit):
         """Advice only: never add app folders to the existing deletion allowlist."""

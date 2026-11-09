@@ -164,6 +164,7 @@ class TreeTests(unittest.TestCase):
 class ApplicationTests(unittest.TestCase):
     def test_real_ui_retains_tree_and_displays_manual_refresh_notice(self):
         with patch.object(SageApplication, '_load_volumes'), \
+             patch.object(SageApplication, '_warm_ai'), \
              patch.object(SageApplication, '_size_finished'):
             app = SageApplication()
             app.withdraw()

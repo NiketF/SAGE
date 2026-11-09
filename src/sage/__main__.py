@@ -43,6 +43,8 @@ def main() -> int:
         # Command-line options survive UAC; environment overrides may not.
         if '--scan-timings' in sys.argv[1:]:
             os.environ['SAGE_SCAN_TIMINGS'] = '1'
+        if '--ai-timings' in sys.argv[1:]:
+            os.environ['SAGE_AI_TIMINGS'] = '1'
         for option in sys.argv[1:]:
             if option.startswith('--mft-parser='):
                 choice = option.split('=', 1)[1]
