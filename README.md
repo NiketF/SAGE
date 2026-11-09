@@ -5,14 +5,12 @@
 
 **A fast Windows storage explorer with an AI assistant that runs locally.**
 
-Find what occupies your drive. Explore the files behind the numbers. Ask what they do—and what removing them could change.
+See what uses space on an NTFS drive. Find and inspect files and folders, then ask what they do and what could happen if you move or remove them.
 
 - Windows 10 or 11
 - Python 3.11 or newer; 64-bit CPython 3.15.2 is the current team test target
 - An NTFS fixed drive
 - Administrator approval for raw volume access
-
-Windows 10 / 11 · NTFS fixed drives · Python + C · Local AI through Ollama
 
 ### Team testing from GitHub
 
@@ -31,27 +29,18 @@ existing CPython 3.11 x64 parser remains available for comparison with
 instead of silently using the slower Python fallback. Team members do not need
 a compiler when the correct binary is present. See [parser details](scripts/C-PARSER.md).
 
-The complete 247-test suite passed on both test runtimes. This checks the tested
-behaviour; actual drive speed and AI answer quality still require running the app.
-No runtime is bundled, no installer is produced, and this source change does not
-create a published release.
-
-## Cleanup suggestions and permanent delete
-
----
-
-## Less guessing. More understanding.
+## What SAGE does
 
 A large folder tells you where your storage went. It does not tell you what the folder does or what you would lose by removing it.
 
 **SAGE brings the file tree and the conversation together.** Its Storage Analysis and Guidance Engine reads NTFS metadata, builds a navigable drive tree, and gives the assistant access to evidence from that scan.
 
 - **Find the space:** browse logical sizes, allocated space, file counts and folder totals.
-- **Understand the item:** select a file or folder and ask about its role, contents or removal options.
-- **Keep the context:** continue the conversation with the selected item, recent questions and retrieved scan evidence.
+- **Find and understand items.** Ask by name, type, size, or date, or ask about an item’s role and contents.
+- **Keep the context.** Follow up about the same item or folder, or name a new area to search.
 - **Stay in control:** use explicit file actions and review cleanup suggestions before confirming a destructive operation.
 
-SAGE is an **actively developed source preview**. The download above contains the project source, not a one-click Windows installer.
+SAGE is an **actively developed source preview**. The source download requires Python and a separate Ollama installation for chat. The AI features and diagnostics described here are from [fixes/new on GitHub](https://github.com/NiketF/SAGE/tree/fixes/new).
 
 ## The SAGE workflow
 
@@ -65,11 +54,11 @@ The tree appears with the retained file metadata and calculated folder totals. L
 
 Expand folders, change the sort order and inspect individual items. The tree shows file size, attributed disk allocation, item counts and file attributes.
 
-Right-click to open an item, reveal it in Explorer, copy its path, copy or move it, rename it, or send it to the Recycle Bin. Drive roots have additional restrictions.
+The right-click menu includes **Ask SAGE**, Open, Show in Explorer, Properties, and common file actions such as Copy, Move, Rename, and Recycle Bin. Use **More Windows options** for the Windows menu. Drive roots have additional restrictions.
 
 ### 03 — Ask SAGE
 
-Select an item and use **Ask SAGE**, or type a question in the assistant pane:
+Type a question in the assistant pane with nothing selected, or use **Ask SAGE** on a specific item.
 
 > Which folders use the most space on this drive?
 >
@@ -81,18 +70,18 @@ Select an item and use **Ask SAGE**, or type a question in the assistant pane:
 >
 > What can I clean up on C:?
 
-The assistant can retrieve metadata, inspect bounded parts of the hierarchy and search eligible local text. Follow-up questions use recent conversation context. For repeated filenames, select the exact item or provide its full path.
+For natural-language questions, the local model interprets the request, including the target, search area, and any filters. SAGE checks paths and measurements against the current scan. It can inspect an item, its parent, and relevant parts of its tree, or search indexed text excerpts. When several exact names match, SAGE shows numbered full paths. Reply with a number to continue the original question about that item. Follow-up questions can use the current folder or item as context.
 
 ### 04 — Review, then act
 
 SAGE distinguishes system-managed items, application-removal options, managed cleanup, personal data and items that need more evidence. Explanations aim to cover purpose, consequences, conditions and an appropriate removal method.
 
-C: cleanup suggestions come from existing rules, with paths and sizes. Suggested categories include selected caches, temporary files, crash reports, development caches and some downloaded installers. A location match is a candidate for review—not a universal safety guarantee.
+C: cleanup suggestions come from existing rules, with paths and sizes. Suggested categories include selected caches, temporary files, crash reports, development caches and some downloaded installers. A location match identifies an item to review. Verify what the item contains and how it is used before removing it.
 
 > [!WARNING]
 > **Cleanup buttons can delete permanently after confirmation.** They do not send items to the Recycle Bin. Tree recycle actions are separate. Review the exact path and consequences before confirming.
 
-The chat model has read-only tools. It does not independently delete, move or edit your files. File-changing controls remain separate, and file operations trigger a fresh scan to update the displayed evidence.
+The chat model uses read-only tools. You control file changes through the app. After deletion, SAGE marks affected items in the existing tree and shows the change count. You can continue working and start a new scan when ready. Until then, measurements may reflect the earlier scan.
 
 ## Measured performance
 
@@ -116,10 +105,10 @@ The current improvements reduce parser allocations and block copies, use a C bat
 
 - Windows 10 or 11 and an NTFS fixed drive.
 - Administrator approval for raw volume access.
-- **64-bit Python 3.11** to use the included compiled parser.
+- **64-bit CPython 3.11 or 3.15** with Tcl/Tk to use the included compiled parser.
 - [Ollama for Windows](https://ollama.com/download/windows) and the `qwen3.5:4b` model for conversational AI.
 
-Python 3.11 or newer can run the source application. Other Python versions need a matching compiled-parser build for the fast path; the Python parser remains available. The included binary targets **CPython 3.11 / Windows x64**.
+Python 3.11 or newer can run the source application. The included binaries target **CPython 3.11 and 3.15 on Windows x64**. Other Python versions use the Python parser unless you build a matching compiled parser.
 
 ### Get the source and launch
 
@@ -147,7 +136,7 @@ Install [Ollama](https://ollama.com/download/windows), then download SAGE's conf
 ollama pull qwen3.5:4b
 ```
 
-Keep Ollama available and launch SAGE. Model preparation happens in the background. Scanning and deterministic evidence features remain available without conversational AI.
+Launch SAGE after installing Ollama and downloading the model. SAGE can start the installed Ollama runtime when needed and load the model in the background. The assistant shows **Loading**, **Online**, or **Offline**. Online means Ollama reports the model loaded. Scanning and tree browsing are available while it loads.
 
 The model download needs internet access. Local inference speed depends on model readiness and CPU/GPU resources. The model is installed separately from SAGE; see the [model page](https://ollama.com/library/qwen3.5).
 
@@ -155,7 +144,7 @@ The model download needs internet access. Local inference speed depends on model
 
 SAGE's current AI client communicates with Ollama at `127.0.0.1:11434`. There is no integrated cloud AI API or API-key requirement.
 
-The local SQLite index stores scan metadata and limited excerpts from eligible text files. MFT scanning itself does not read every file's contents. Text indexing is bounded by format, size, time and location rules; it is not a complete content audit.
+The local SQLite index stores scan metadata. Its FTS5 index searches limited excerpts from eligible text files. MFT scanning itself does not read every file's contents. Text indexing is bounded by format, size, time and location rules; it is not a complete content audit.
 
 ## Know the boundaries
 
@@ -165,7 +154,7 @@ SAGE helps you investigate and decide. It does not establish every application's
 - **Space accounting:** logical size, attributed allocation and recoverable space differ. Allocated totals still need validation on some volumes; a scan total is not a promise of space that deletion will recover.
 - **Hard links:** multiple paths can share physical storage. Removing one path may free no file data.
 - **Duplicate candidates:** equal measured sizes identify possibilities. File contents are not compared to prove duplicates.
-- **AI coverage:** retrieved hierarchy samples and text searches can be partial. PDF/Office content adapters and embeddings are not included. Treat explanations as assistance, not permission to delete.
+- **AI coverage:** retrieved hierarchy samples and text searches can be partial. The published branch searches scan metadata and approved text excerpts. Embedding-based similarity search and PDF/Office content adapters are outside that scope. Review cleanup advice before acting.
 - **NTFS support:** this preview does not provide deleted-file forensics or network/non-NTFS scanning. MFT layouts requiring additional mapping records beyond the supported root mapping are rejected rather than reported as complete.
 
 <details>
@@ -186,7 +175,7 @@ NTFS drive
           → Streamed explanation
 ```
 
-Python coordinates the application and retains the existing `ScanResult` contract. The C extension accelerates record processing. Tk updates stay on the main thread; worker results are checked against the active scan so stale results cannot replace a newer drive's view.
+The diagram summarizes the evidence flow. For natural-language requests, the assistant first interprets the question, then retrieves the evidence it needs. Python coordinates the application and retains the existing `ScanResult` contract. The C extension accelerates record processing. Tk updates stay on the main thread; worker results are checked against the active scan so stale results cannot replace a newer drive's view.
 
 Relevant code: [MFT reader](src/sage/platform/windows/mft.py), [C parser](src/sage/platform/windows/_mft_fast.c), [hierarchy](src/sage/services/hierarchy.py), [conversation](src/sage/services/conversation.py), [tool validation](src/sage/services/tool_registry.py), and [cleanup rules](src/sage/services/cleanup.py).
 
@@ -202,7 +191,7 @@ $env:PYTHONPATH = 'src;tests'
 python -B -m unittest discover -s tests
 ```
 
-The latest optimization was checked with **233 automated tests**. Compiled-parser checks need the matching extension installed. Automated checks support, rather than replace, validation in the real application.
+The development checks cover scan parsing, file operations, search, conversation scope, duplicate choices, and model startup. Compiled-parser checks need the matching extension. Use the running app to verify drive timings and live answer quality.
 
 Capture a local timing report with an explicit parser selection:
 
@@ -213,6 +202,8 @@ python -B .\run_sage.py --scan-timings --mft-parser=c
 Use `--mft-parser=python` for comparison. Timings are saved locally to `%LOCALAPPDATA%\SAGE\scan-timing-last.json`. Check the active parser, record count and skipped records alongside duration. See [timing definitions](scripts/SCAN-TIMING.md) and [compiled-parser build instructions](scripts/C-PARSER.md).
 
 </details>
+
+For AI diagnostics, add `--ai-timings` to the launch command. The app writes startup, model-call, lookup, and reply timings to `%LOCALAPPDATA%\SAGE\ai-timing-last.json`. When SAGE starts Ollama in timing mode, it also saves a separate local Ollama server log. Compare cold and warm runs separately.
 
 ## Help improve SAGE
 
